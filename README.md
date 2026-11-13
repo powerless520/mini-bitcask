@@ -1,6 +1,6 @@
 # mini-bitcask
 
-> 用纯 Rust（零依赖，仅 std）实现的 Bitcask 风格 KV 存储引擎，核心约 510 行（含 11 个测试共 747 行）。
+> 用纯 Rust（零依赖，仅 std）实现的 Bitcask 风格 KV 存储引擎，核心约 670 行（含 14 个测试共 1009 行）。
 > 这是一个**学习型开源项目**：目标不是和 RocksDB 竞争，而是把「造存储引擎」的全过程开源出来。
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org/)
@@ -35,10 +35,12 @@ get("name")                            └────────────�
 mydata/
 ├── active.log            唯一可写文件，append-only 追加新写入
 ├── segment-000001.log    只读分段（merge 产物，写完后永不修改）
+├── hint-000001.log       分段的索引备份（key + 位置，不含 value），加速重启
 └── merge-000002.tmp      merge 中的临时文件，rename 后成为正式分段
 ```
 
 内存索引保存 `key -> (file_id, offset)`，读操作按位置直接 seek，一次 IO 拿到 value。
+重启时：有完好的 hint 就直接用它建索引（不碰数据文件）；否则重放数据。
 
 ## 快速开始
 
@@ -102,7 +104,10 @@ merge 不是"原地覆写"，而是经典的三步走：
 - [x] **v0.3 Merge/Compaction**：active.log + 只读分段的多文件布局；
       存活数据重写进新分段 → 原子 rename → 删除旧文件（Bitcask 论文 §3）。
       实测：10 轮覆盖写后 merge，104 B → 41 B，压缩到 39.4%
-- [ ] **v0.4 Hint file**：merge 时顺便生成 hint file（key + 位置，不含 value），重启时不必扫描全量数据、直接建索引
+- [x] **v0.4 Hint file**：merge 时顺便生成 `hint-<id>.log`（key + 位置 + 长度，不含 value）。
+      重启时若 hint 结构完整则直接建索引，完全跳过数据扫描；
+      任一校验失败（残缺/越界）则整体作废，回退全量重放 —— 宁可不加速也不能读错。
+      实测教训：残缺 hint 必须回退而不是报错 —— 容错是 hint 信任策略的一部分
 - [ ] **v0.5 并发句柄**：`Arc<RwLock<Bitcask>>` 或多 reader 单 writer（Bitcask 原文的设计）
 - [ ] **v0.6 索引优化**：keydir 换成 `BTreeMap` 支持范围查询 / 尝试内嵌布隆过滤器
 - [ ] **v0.7 基准测试**：用 `criterion` 跑 set/get 压测，对比纯 HashMap 基线

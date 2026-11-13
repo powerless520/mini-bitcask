@@ -1,4 +1,4 @@
-//! mini-bitcask —— 一个 ~510 行的 Bitcask 风格 KV 存储引擎（教学/开源项目）
+//! mini-bitcask —— 一个 ~670 行的 Bitcask 风格 KV 存储引擎（教学/开源项目）
 //!
 //! 设计模型（来自 Basho/riak 的 Bitcask 论文）：
 //!
@@ -31,11 +31,21 @@
 //!      - rename 之后崩溃：新旧文件并存，但重放按分段 id 升序、active 最后，
 //!        新分段（id 更大）会覆盖旧数据，结果依然正确
 //!
-//! 这是刻意留白的项目：hint file、并发句柄等留作后续演进路线，见 README.md 的 Roadmap。
+//! v0.4 hint file（对应 Bitcask 论文 §3.2）：
+//!
+//!   merge 时为每个新分段顺便写一份 hint-<id>.log：只存 (key, 位置, 长度)，不含 value。
+//!   重启时若 hint 结构完整，直接读它建索引，完全跳过数据扫描 ——
+//!   数据文件越大，启动加速越明显。信任策略（宁可回退也不读错）：
+//!     - hint 必须能被逐字节精确解析到文件尾（部分条目 = 整个 hint 作废）
+//!     - 每条 offset + entry_len 必须不超过分段文件大小
+//!     - 任一校验失败 -> 回退到 v0.3 的全量重放
+//!   rename 顺序：先数据分段、后 hint —— 中间崩溃只会"缺 hint"，自动回退，依然安全。
+//!
+//! 这是刻意留白的项目：并发句柄等留作后续演进路线，见 README.md 的 Roadmap。
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -46,7 +56,9 @@ const FLAG_DEL: u8 = 1;
 const ACTIVE_FILE: &str = "active.log";
 /// 只读分段文件名前缀
 const SEGMENT_PREFIX: &str = "segment-";
-/// merge 临时文件名前缀
+/// 分段对应的 hint 文件名前缀
+const HINT_PREFIX: &str = "hint-";
+/// merge 临时文件名前缀（数据与 hint 共用，靠扩展名 .tmp 识别）
 const MERGE_TMP_PREFIX: &str = "merge-";
 /// active.log 在索引中使用的 file_id
 const ACTIVE_FILE_ID: u64 = 0;
@@ -112,10 +124,124 @@ fn segment_file_name(id: u64) -> String {
     format!("{SEGMENT_PREFIX}{id:06}.log")
 }
 
+fn hint_file_name(id: u64) -> String {
+    format!("{HINT_PREFIX}{id:06}.log")
+}
+
 fn parse_segment_id(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
     let digits = name.strip_prefix(SEGMENT_PREFIX)?.strip_suffix(".log")?;
     digits.parse::<u64>().ok()
+}
+
+/// 把一条 hint 记录编码成磁盘字节流（不含 value，这是 hint 省空间的关键）：
+///
+///   ┌──────────┬────────────┬─────────────┬──────────┬────────────┐
+///   │  key_len │  value_len │  entry_len  │  offset  │  key bytes │
+///   │   u32    │    u32     │    u32      │   u64    │  key_len B │
+///   └──────────┴────────────┴─────────────┴──────────┴────────────┘
+fn encode_hint_entry(key: &str, value_len: usize, entry_len: u64, offset: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 + key.len());
+    out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(value_len as u32).to_be_bytes());
+    out.extend_from_slice(&(entry_len as u32).to_be_bytes());
+    out.extend_from_slice(&offset.to_be_bytes());
+    out.extend_from_slice(key.as_bytes());
+    out
+}
+
+/// 尽力读满 buf。
+///   Ok(true)  -> 读满
+///   Ok(false) -> 在起始位置遇到干净 EOF（读完了）
+/// 读到一半 EOF 视为数据损坏，返回 Err（由调用方决定回退策略）。
+fn fill_exact(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<bool> {
+    if buf.is_empty() {
+        return Ok(true);
+    }
+    let mut got = reader.read(&mut buf[..1])?;
+    if got == 0 {
+        return Ok(false); // 干净 EOF
+    }
+    while got < buf.len() {
+        let n = reader.read(&mut buf[got..])?;
+        if n == 0 {
+            return Err(invalid_data("partial record at end of file"));
+        }
+        got += n;
+    }
+    Ok(true)
+}
+
+/// 尝试从 hint 文件重建指定分段的索引。
+///   Ok(true)  -> 成功，index 已更新
+///   Ok(false) -> hint 无效（结构不完整/越界），应回退全量重放
+/// 结构校验（宁可不加速也不能读错）：
+///   1. 必须逐字节精确解析到文件尾，任何残留字节即整个 hint 作废
+///   2. 每条 offset + entry_len 不得超过分段文件大小
+fn load_index_from_hint(
+    hint_path: &Path,
+    file_id: u64,
+    seg_len: u64,
+    index: &mut HashMap<String, ValuePos>,
+) -> io::Result<bool> {
+    let file = match File::open(hint_path) {
+        Ok(f) => f,
+        Err(_) => return Ok(false),
+    };
+    let mut reader = BufReader::new(file);
+
+    // hint 里读到一半 EOF = 结构残缺，整个 hint 作废（回退全量重放），
+    // 而不是让 open 失败 —— 容错是 hint 信任策略的一部分
+    macro_rules! try_hint_read {
+        ($buf:expr) => {
+            match fill_exact(&mut reader, $buf) {
+                Ok(v) => v,
+                Err(_) => return Ok(false),
+            }
+        };
+    }
+
+    loop {
+        // header：key_len + value_len + entry_len + offset = 20 字节
+        let mut header = [0u8; 20];
+        if !try_hint_read!(&mut header) {
+            return Ok(true); // 干净 EOF：整个 hint 有效
+        }
+        let key_len =
+            u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let _value_len =
+            u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let entry_len = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+        let offset = u64::from_be_bytes([
+            header[12], header[13], header[14], header[15], header[16], header[17],
+            header[18], header[19],
+        ]);
+
+        const MAX_KEY: usize = 1 << 20;
+        if key_len > MAX_KEY {
+            return Ok(false);
+        }
+        if offset.saturating_add(entry_len as u64) > seg_len {
+            return Ok(false); // 指向分段外的位置：hint 与数据不匹配
+        }
+
+        let mut key = vec![0u8; key_len];
+        if !try_hint_read!(&mut key) {
+            return Ok(false); // 尾部残缺
+        }
+        let key = match String::from_utf8(key) {
+            Ok(k) => k,
+            Err(_) => return Ok(false),
+        };
+
+        index.insert(
+            key,
+            ValuePos {
+                file_id,
+                offset,
+            },
+        );
+    }
 }
 
 /// 一个 Bitcask 实例对应一个数据目录。
@@ -147,7 +273,9 @@ impl Bitcask {
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with(MERGE_TMP_PREFIX) && name.ends_with(".tmp") {
+                if name.ends_with(".tmp")
+                    && (name.starts_with(MERGE_TMP_PREFIX) || name.starts_with(HINT_PREFIX))
+                {
                     let _ = fs::remove_file(&path);
                 }
             }
@@ -168,17 +296,31 @@ impl Bitcask {
             .collect();
         segment_ids.sort_unstable();
 
+        let mut index: HashMap<String, ValuePos> = HashMap::new();
         let mut segments = HashMap::new();
         for &id in &segment_ids {
-            let f = OpenOptions::new()
-                .read(true)
-                .open(dir.join(segment_file_name(id)))?;
-            segments.insert(id, f);
+            let seg_path = dir.join(segment_file_name(id));
+            let seg_file = OpenOptions::new().read(true).open(&seg_path)?;
+            let seg_len = seg_file.metadata()?.len();
+
+            // v0.4 快速路径：hint 结构完整 -> 直接建索引，跳过数据扫描
+            // 回退路径：hint 缺失或无效 -> 全量重放数据文件（v0.3 行为）
+            let mut loaded_from_hint = false;
+            let hint_path = dir.join(hint_file_name(id));
+            if hint_path.exists() {
+                loaded_from_hint = load_index_from_hint(&hint_path, id, seg_len, &mut index)?;
+            }
+            if !loaded_from_hint {
+                let mut data = seg_file.try_clone()?;
+                Self::replay_file(&mut data, id, &mut index)?;
+            }
+
+            segments.insert(id, seg_file);
         }
 
         let mut store = Bitcask {
             dir,
-            index: HashMap::new(),
+            index,
             segments,
             next_segment_id: segment_ids.last().copied().unwrap_or(0) + 1,
             writer: BufWriter::new(file),
@@ -187,14 +329,8 @@ impl Bitcask {
             corrupt_tail_bytes: 0,
         };
 
-        // 重放顺序：分段 id 升序 -> active 最后（active 永远是最新写入）
+        // active 重放在最后（active 永远是最新写入），
         // 这样"后写覆盖先写"的语义在重启后依然成立
-        for &id in &segment_ids {
-            if let Some(seg) = store.segments.get_mut(&id) {
-                let (valid, _corrupt) = Self::replay_file(seg, id, &mut store.index)?;
-                let _ = valid;
-            }
-        }
         let mut active = store.active_reader.try_clone()?;
         let (valid, corrupt) = Self::replay_file(&mut active, ACTIVE_FILE_ID, &mut store.index)?;
         store.corrupt_tail_bytes = corrupt;
@@ -375,9 +511,13 @@ impl Bitcask {
         let tmp_path = self
             .dir
             .join(format!("{MERGE_TMP_PREFIX}{new_id:06}.tmp"));
+        let hint_tmp_path = self
+            .dir
+            .join(format!("{HINT_PREFIX}{new_id:06}.tmp"));
         let final_path = self.dir.join(segment_file_name(new_id));
+        let hint_final_path = self.dir.join(hint_file_name(new_id));
 
-        // 1) 存活数据全部重写进临时文件
+        // 1) 存活数据全部重写进临时文件；同时写 hint（不含 value 的索引备份）
         let mut offset: u64 = 0;
         let mut new_index: HashMap<String, ValuePos> = HashMap::with_capacity(snapshot.len());
         {
@@ -388,6 +528,13 @@ impl Bitcask {
                 .open(&tmp_path)?;
             let mut tmp_writer = BufWriter::new(tmp_file);
 
+            let hint_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&hint_tmp_path)?;
+            let mut hint_writer = BufWriter::new(hint_file);
+
             for (key, pos) in &snapshot {
                 let reader = self.reader_for(pos.file_id)?;
                 let Some((_, _, value, _)) = Self::read_entry_at(reader, pos.offset)? else {
@@ -397,6 +544,13 @@ impl Bitcask {
                 };
                 let entry = encode_entry(key, FLAG_PUT, &value);
                 tmp_writer.write_all(&entry)?;
+                // hint 记录这条数据在新分段中的位置，value 本身不写
+                hint_writer.write_all(&encode_hint_entry(
+                    key,
+                    value.len(),
+                    entry.len() as u64,
+                    offset,
+                ))?;
                 new_index.insert(
                     key.clone(),
                     ValuePos {
@@ -409,14 +563,20 @@ impl Bitcask {
 
             tmp_writer.flush()?;
             tmp_writer.get_ref().sync_all()?;
+            hint_writer.flush()?;
+            hint_writer.get_ref().sync_all()?;
         } // 关闭临时文件句柄
 
-        // 2) 原子替换：rename 在同一文件系统内是原子的
+        // 2) 原子替换：rename 在同一文件系统内是原子的。
+        //    先数据、后 hint —— 若在两次 rename 之间崩溃，重启只会发现 hint 缺失，
+        //    自动回退到全量重放，数据依然完整
         fs::rename(&tmp_path, &final_path)?;
+        let _ = fs::rename(&hint_tmp_path, &hint_final_path); // hint 失败不致命
 
-        // 3) 旧文件已无引用，删除它们；active.log 截断为空
+        // 3) 旧文件已无引用，删除它们（含旧 hint）；active.log 截断为空
         for &old_id in self.segments.keys() {
             let _ = fs::remove_file(self.dir.join(segment_file_name(old_id)));
+            let _ = fs::remove_file(self.dir.join(hint_file_name(old_id)));
         }
         self.segments.clear();
         let new_reader = OpenOptions::new().read(true).open(&final_path)?;
@@ -722,9 +882,12 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let leftover = dir.join(format!("{MERGE_TMP_PREFIX}000042.tmp"));
         fs::write(&leftover, b"garbage from crashed merge").unwrap();
+        let leftover_hint = dir.join(format!("{HINT_PREFIX}000042.tmp"));
+        fs::write(&leftover_hint, b"garbage from crashed merge hint").unwrap();
 
         let db = Bitcask::open(&dir).unwrap();
         assert!(!leftover.exists(), "崩溃遗留的 merge 临时文件应被清理");
+        assert!(!leftover_hint.exists(), "崩溃遗留的 hint 临时文件应被清理");
         assert_eq!(db.len(), 0);
     }
 
@@ -743,5 +906,104 @@ mod tests {
         drop(db);
         let db2 = Bitcask::open(&dir).unwrap();
         assert_eq!(db2.len(), 0);
+    }
+
+    // ---------- v0.4：hint file ----------
+
+    #[test]
+    fn test_hint_rebuilds_index_without_scanning_data() {
+        let dir = temp_dir("hint");
+        let seg_path = dir.join(segment_file_name(1));
+        let hint_path = dir.join(hint_file_name(1));
+
+        let value = vec![9u8; 4096];
+        {
+            let mut db = Bitcask::open(&dir).unwrap();
+            for i in 0..50u32 {
+                db.set(format!("key{i}"), value.clone()).unwrap();
+            }
+            db.merge().unwrap();
+            db.sync().unwrap();
+        }
+        assert!(hint_path.exists(), "merge 后应生成 hint 文件");
+
+        // 破坏数据文件的 value 内容（CRC 必然失效）。
+        // 若重启走的是 hint 快速路径，索引照常重建；若走数据重放则 key 会丢失。
+        let mut bytes = fs::read(&seg_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        fs::write(&seg_path, &bytes).unwrap();
+
+        let mut db = Bitcask::open(&dir).unwrap();
+        // 50 个 key 全部由 hint 恢复（数据文件已被破坏，重放路径做不到这一点）
+        assert_eq!(db.len(), 50);
+        // 分段写入顺序是哈希序，无法预知被破坏的是哪个 key：
+        // 恰好一个 key 的数据被 CRC 拦下，其余 49 个照常可读
+        let broken: Vec<String> = (0..50u32)
+            .map(|i| format!("key{i}"))
+            .filter(|k| db.get(k).is_err())
+            .collect();
+        assert_eq!(broken.len(), 1, "恰好一条数据被破坏: {broken:?}");
+        // 完好的数据照常可读
+        for i in 0..50u32 {
+            let key = format!("key{i}");
+            if key != broken[0] {
+                assert_eq!(db.get(&key).unwrap().unwrap(), value);
+            }
+        }
+    }
+
+    #[test]
+    fn test_hint_fallback_when_missing_or_invalid() {
+        let dir = temp_dir("hint-fallback");
+        let value = vec![1u8; 512];
+
+        {
+            let mut db = Bitcask::open(&dir).unwrap();
+            for i in 0..20u32 {
+                db.set(format!("k{i}"), value.clone()).unwrap();
+            }
+            db.merge().unwrap();
+        }
+        let hint = dir.join(hint_file_name(1));
+
+        // 场景 1：hint 尾部残缺 -> 整个 hint 作废，回退全量重放
+        let mut bytes = fs::read(&hint).unwrap();
+        bytes.truncate(bytes.len() - 3); // 切掉 3 个字节，最后一条 hint 记录不完整
+        fs::write(&hint, &bytes).unwrap();
+
+        let mut db = Bitcask::open(&dir).unwrap();
+        assert_eq!(db.len(), 20, "残缺 hint 必须被拒绝，回退到数据重放");
+        assert_eq!(db.get("k0").unwrap().unwrap(), value);
+        drop(db);
+
+        // 场景 2：hint 缺失 -> 回退全量重放
+        fs::remove_file(&hint).unwrap();
+        let mut db2 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db2.len(), 20);
+        assert_eq!(db2.get("k7").unwrap().unwrap(), value);
+    }
+
+    #[test]
+    fn test_merge_removes_old_hint_files() {
+        let dir = temp_dir("hint-cleanup");
+        let mut db = Bitcask::open(&dir).unwrap();
+
+        db.set("a", "1").unwrap();
+        db.merge().unwrap();
+        assert!(dir.join(hint_file_name(1)).exists());
+
+        db.set("b", "2").unwrap();
+        db.merge().unwrap(); // 第二次 merge：旧分段 1 及其 hint 应被删除
+
+        assert!(!dir.join(hint_file_name(1)).exists());
+        assert!(dir.join(hint_file_name(2)).exists());
+        assert_eq!(db.len(), 2);
+
+        drop(db);
+        let mut db2 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db2.len(), 2);
+        assert_eq!(db2.get_string("a").unwrap().as_deref(), Some("1"));
+        assert_eq!(db2.get_string("b").unwrap().as_deref(), Some("2"));
     }
 }
