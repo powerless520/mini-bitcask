@@ -160,7 +160,7 @@ cargo run --release --example bench
 ```
 
 零依赖的手写基准（不是 `criterion`）——理由见下文「为什么不用 criterion」。
-10 万 key × 128 B value（约 14.1 MB），每组都和纯 `BTreeMap<Vec<u8>, Vec<u8>>` 基线对打：
+10 万 key × 128 B value（约 14.1 MB），每组都和纯 `BTreeMap<String, Vec<u8>>` 基线对打：
 
 ```
 顺序写入 set                 535 ns/op     1868363 ops/s   | BTreeMap 基线     132 ns/op（4.0x）
