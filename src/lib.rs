@@ -1,4 +1,4 @@
-//! mini-bitcask —— 一个 ~820 行的 Bitcask 风格 KV 存储引擎（教学/开源项目）
+//! mini-bitcask —— 一个 ~1010 行的 Bitcask 风格 KV 存储引擎（教学/开源项目）
 //!
 //! 设计模型（来自 Basho/riak 的 Bitcask 论文）：
 //!
@@ -51,8 +51,14 @@
 //!   - range()/scan_prefix() 先在索引读锁内收集 key 列表（短持锁），
 //!     再逐个 get 取 value —— 不阻塞写入，并自动继承 get 的并发 merge 重试逻辑
 //!
-//! 这是刻意留白的项目：布隆过滤器、基准测试等
-//! 留作后续演进路线，见 README.md 的 Roadmap。
+//! v0.7 布隆过滤器：每个分段在 merge 时生成 bloom-<id>.filter（位图 + 双哈希，目标误判率 1%），
+//!   重启时加载、随分段删除。
+//!
+//!   诚实说明：keydir 全量驻留内存时，布隆过滤器对 get **没有** 提速作用（索引本身是精确过滤器）。
+//!   它的价值在于 merge 期判断 key 是否可能在某分段、以及为未来 keydir 分区/落盘预留负查询能力。
+//!   因此本版把能力做完整（生成/持久化/恢复/负查询 API），而不是假装它是性能优化。
+//!
+//! 这是刻意留白的项目：基准测试留作后续演进路线，见 README.md 的 Roadmap。
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -70,6 +76,8 @@ const ACTIVE_FILE: &str = "active.log";
 const SEGMENT_PREFIX: &str = "segment-";
 /// 分段对应的 hint 文件名前缀
 const HINT_PREFIX: &str = "hint-";
+/// 分段对应的布隆过滤器文件名前缀
+const BLOOM_PREFIX: &str = "bloom-";
 /// merge 临时文件名前缀（数据与 hint 共用，靠扩展名 .tmp 识别）
 const MERGE_TMP_PREFIX: &str = "merge-";
 /// active.log 在索引中使用的 file_id
@@ -159,6 +167,10 @@ fn segment_file_name(id: u64) -> String {
 
 fn hint_file_name(id: u64) -> String {
     format!("{HINT_PREFIX}{id:06}.log")
+}
+
+fn bloom_file_name(id: u64) -> String {
+    format!("{BLOOM_PREFIX}{id:06}.filter")
 }
 
 fn parse_segment_id(path: &Path) -> Option<u64> {
@@ -255,6 +267,124 @@ fn load_index_from_hint(
     }
 }
 
+// ---------------- 布隆过滤器（v0.7） ----------------
+
+/// 布隆过滤器文件魔数
+const BLOOM_MAGIC: &[u8; 4] = b"MBF1";
+
+/// 极简布隆过滤器（零依赖）：位图 + 双哈希（Kirsch-Mitzenmacher 技巧）。
+///
+/// 定位说明（如实记录，避免自欺）：
+/// 本引擎的 keydir 全量驻留内存，所以布隆过滤器对 get **没有** 提速作用——
+/// 索引本身就是精确过滤器。它的价值在：
+///   1. merge 时快速判断"某 key 是否可能在某分段中"，避免无谓的磁盘读
+///   2. 为未来 keydir 分区/落盘（索引不再全量驻留）预留负查询加速能力
+///
+/// 因此 v0.7 先把能力实现并持久化（每分段一个 bloom 文件），随分段生命周期管理。
+pub struct Bloom {
+    /// 位图（以 u64 为单位）
+    bits: Vec<u64>,
+    /// 哈希函数个数
+    k: u8,
+    /// 位图总位数
+    m: u64,
+}
+
+impl Bloom {
+    /// 按预期元素数 n 与目标误判率 fp_rate 计算最优 m 与 k：
+    ///   m = -n·ln(p) / (ln2)²，k = (m/n)·ln2
+    pub fn with_capacity(n: usize, fp_rate: f64) -> Self {
+        let n = n.max(1) as f64;
+        let ln2 = std::f64::consts::LN_2;
+        let m = ((-(n * fp_rate.ln())) / (ln2 * ln2)).ceil() as u64;
+        let m = m.max(64);
+        let k = (((m as f64 / n) * ln2).round() as u32).clamp(1, 16) as u8;
+        Bloom {
+            bits: vec![0u64; m.div_ceil(64) as usize],
+            k,
+            m,
+        }
+    }
+
+    /// 双哈希：FNV-1a 作为 h1，另一个混合函数作为 h2（强制奇数，保证步长非零）。
+    fn hashes(key: &[u8]) -> (u64, u64) {
+        let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in key {
+            h1 ^= b as u64;
+            h1 = h1.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let mut h2: u64 = 0x9E37_79B9_7F4A_7C15;
+        for &b in key {
+            h2 = (h2 ^ b as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .rotate_left(5);
+        }
+        (h1, h2 | 1)
+    }
+
+    pub fn insert(&mut self, key: &[u8]) {
+        let (h1, h2) = Self::hashes(key);
+        for i in 0..self.k as u64 {
+            let idx = h1.wrapping_add(i.wrapping_mul(h2)) % self.m;
+            self.bits[(idx / 64) as usize] |= 1u64 << (idx % 64);
+        }
+    }
+
+    /// 返回 false 表示"一定不存在"（无假阴性）；返回 true 表示"可能存在"。
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        let (h1, h2) = Self::hashes(key);
+        for i in 0..self.k as u64 {
+            let idx = h1.wrapping_add(i.wrapping_mul(h2)) % self.m;
+            if self.bits[(idx / 64) as usize] & (1u64 << (idx % 64)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 序列化：[magic 4B][k 1B][m 8B][bitmap]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(13 + self.bits.len() * 8);
+        out.extend_from_slice(BLOOM_MAGIC);
+        out.push(self.k);
+        out.extend_from_slice(&self.m.to_be_bytes());
+        for word in &self.bits {
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    /// 反序列化：任何结构异常都返回 None（宁可退化也不误判）。
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < 13 || &buf[..4] != BLOOM_MAGIC {
+            return None;
+        }
+        let k = buf[4];
+        let m = u64::from_be_bytes([
+            buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12],
+        ]);
+        if m == 0 || m > (1 << 40) || !(1..=16).contains(&k) {
+            return None;
+        }
+        let words = m.div_ceil(64) as usize;
+        let body = &buf[13..];
+        if body.len() != words * 8 {
+            return None;
+        }
+        let mut bits = Vec::with_capacity(words);
+        for chunk in body.as_chunks::<8>().0 {
+            bits.push(u64::from_be_bytes(*chunk));
+        }
+        Some(Bloom { bits, k, m })
+    }
+
+    /// 理论误判率（用于测试与文档对照）
+    pub fn fp_rate_estimate(&self, n: usize) -> f64 {
+        let n = n.max(1) as f64;
+        (1.0 - (-(self.k as f64 * n) / self.m as f64).exp()).powi(self.k as i32)
+    }
+}
+
 // ---------------- 共享状态（v0.5 并发模型） ----------------
 
 /// active.log 的读写句柄 + 记账。写入串行化的核心：所有写都锁这里。
@@ -267,6 +397,13 @@ struct ActiveFile {
     bytes: u64,
 }
 
+/// 一个只读分段：数据文件读句柄 + 可选布隆过滤器。
+struct Segment {
+    file: Mutex<File>,
+    /// merge 时生成；重启时从 bloom-<id>.filter 恢复（文件缺失/损坏则为 None）
+    bloom: Option<Bloom>,
+}
+
 /// 被 Arc 共享的内部状态。
 ///
 /// 锁顺序（所有代码路径必须一致，防死锁）：active -> index -> segments。
@@ -274,8 +411,8 @@ struct Shared {
     dir: PathBuf,
     /// 内存索引：key -> 最新值的位置
     index: RwLock<KeyDir>,
-    /// 只读分段文件的读句柄（id -> 句柄）。读用读锁，merge 换血用写锁
-    segments: RwLock<HashMap<u64, Arc<Mutex<File>>>>,
+    /// 只读分段（id -> 句柄 + 布隆过滤器）。读用读锁，merge 换血用写锁
+    segments: RwLock<HashMap<u64, Arc<Segment>>>,
     /// active.log 读写句柄（所有写入串行化的单点）
     active: Mutex<ActiveFile>,
     /// 下一个可用的分段 id
@@ -320,7 +457,9 @@ impl Bitcask {
             let path = entry?.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.ends_with(".tmp")
-                    && (name.starts_with(MERGE_TMP_PREFIX) || name.starts_with(HINT_PREFIX))
+                    && (name.starts_with(MERGE_TMP_PREFIX)
+                        || name.starts_with(HINT_PREFIX)
+                        || name.starts_with(BLOOM_PREFIX))
                 {
                     let _ = fs::remove_file(&path);
                 }
@@ -343,7 +482,7 @@ impl Bitcask {
         segment_ids.sort_unstable();
 
         let mut index = KeyDir::new();
-        let mut segments: HashMap<u64, Arc<Mutex<File>>> = HashMap::new();
+        let mut segments: HashMap<u64, Arc<Segment>> = HashMap::new();
         for &id in &segment_ids {
             let seg_path = dir.join(segment_file_name(id));
             let seg_file = OpenOptions::new().read(true).open(&seg_path)?;
@@ -361,7 +500,18 @@ impl Bitcask {
                 Self::replay_file(&mut data, id, &mut index)?;
             }
 
-            segments.insert(id, Arc::new(Mutex::new(seg_file)));
+            // v0.7：恢复该分段的布隆过滤器（缺失或损坏 -> None，只损失负查询加速）
+            let bloom = fs::read(dir.join(bloom_file_name(id)))
+                .ok()
+                .and_then(|bytes| Bloom::from_bytes(&bytes));
+
+            segments.insert(
+                id,
+                Arc::new(Segment {
+                    file: Mutex::new(seg_file),
+                    bloom,
+                }),
+            );
         }
 
         let corrupt_tail_bytes = AtomicU64::new(0);
@@ -540,8 +690,8 @@ impl Bitcask {
                 match handle {
                     // 分段已被并发 merge 删除 -> 直接走重读索引逻辑
                     None => Ok(None),
-                    Some(file) => {
-                        let mut reader = file.lock().unwrap();
+                    Some(segment) => {
+                        let mut reader = segment.file.lock().unwrap();
                         Self::read_entry_at(&mut reader, pos.offset)
                     }
                 }
@@ -626,10 +776,10 @@ impl Bitcask {
                         })?;
                     value
                 } else {
-                    let file = segments.get(&pos.file_id).ok_or_else(|| {
+                    let segment = segments.get(&pos.file_id).ok_or_else(|| {
                         invalid_data(format!("merge failed: segment {} missing", pos.file_id))
                     })?;
-                    let mut reader = file.lock().unwrap();
+                    let mut reader = segment.file.lock().unwrap();
                     let (_, _, value, _) = Self::read_entry_at(&mut reader, pos.offset)?
                         .ok_or_else(|| {
                             invalid_data(format!("merge failed: missing data for key {key:?}"))
@@ -643,8 +793,16 @@ impl Bitcask {
         let new_id = self.shared.next_segment_id.load(Ordering::Relaxed);
         let tmp_path = self.shared.dir.join(format!("{MERGE_TMP_PREFIX}{new_id:06}.tmp"));
         let hint_tmp_path = self.shared.dir.join(format!("{HINT_PREFIX}{new_id:06}.tmp"));
+        let bloom_tmp_path = self.shared.dir.join(format!("{BLOOM_PREFIX}{new_id:06}.tmp"));
         let final_path = self.shared.dir.join(segment_file_name(new_id));
         let hint_final_path = self.shared.dir.join(hint_file_name(new_id));
+        let bloom_final_path = self.shared.dir.join(bloom_file_name(new_id));
+
+        // v0.7：为新分段构建布隆过滤器（目标误判率 1%）
+        let mut bloom = Bloom::with_capacity(live.len(), 0.01);
+        for (key, _) in &live {
+            bloom.insert(key.as_bytes());
+        }
 
         // 2) 存活数据重写进临时文件；同时写 hint（不含 value 的索引备份）
         let mut offset: u64 = 0;
@@ -690,23 +848,36 @@ impl Bitcask {
             hint_writer.get_ref().sync_all()?;
         } // 关闭临时文件句柄
 
+        // 布隆过滤器很小，直接写临时文件 + fsync
+        fs::write(&bloom_tmp_path, bloom.to_bytes())?;
+        if let Ok(f) = File::open(&bloom_tmp_path) {
+            let _ = f.sync_all();
+        }
+
         // 3) 原子替换：rename 在同一文件系统内是原子的。
-        //    先数据、后 hint —— 若在两次 rename 之间崩溃，重启只会发现 hint 缺失，
-        //    自动回退到全量重放，数据依然完整
+        //    顺序：数据 -> hint -> bloom。中途崩溃只会损失加速文件，数据依然完整
         fs::rename(&tmp_path, &final_path)?;
         let _ = fs::rename(&hint_tmp_path, &hint_final_path); // hint 失败不致命
+        let _ = fs::rename(&bloom_tmp_path, &bloom_final_path); // bloom 失败不致命
 
-        // 4) 换血：删旧分段（含旧 hint）、截断 active、切换索引。
+        // 4) 换血：删旧分段（含旧 hint/bloom）、截断 active、切换索引。
         //    锁顺序 active -> index -> segments，与读路径一致，无死锁风险
         let mut index = self.shared.index.write().unwrap();
         let mut segments = self.shared.segments.write().unwrap();
         for &old_id in segments.keys() {
             let _ = fs::remove_file(self.shared.dir.join(segment_file_name(old_id)));
             let _ = fs::remove_file(self.shared.dir.join(hint_file_name(old_id)));
+            let _ = fs::remove_file(self.shared.dir.join(bloom_file_name(old_id)));
         }
         segments.clear();
         let new_reader = OpenOptions::new().read(true).open(&final_path)?;
-        segments.insert(new_id, Arc::new(Mutex::new(new_reader)));
+        segments.insert(
+            new_id,
+            Arc::new(Segment {
+                file: Mutex::new(new_reader),
+                bloom: Some(bloom),
+            }),
+        );
         self.shared
             .next_segment_id
             .store(new_id + 1, Ordering::Relaxed);
@@ -719,6 +890,24 @@ impl Bitcask {
         // 合并后的总字节数直接用新分段的文件大小计算
         let after = fs::metadata(&final_path)?.len();
         Ok((before, after))
+    }
+
+    /// 布隆过滤器负查询：返回 false 表示「该 key 在索引与所有分段中一定不存在」。
+    ///
+    /// 返回 true 只代表「可能存在」（布隆过滤器有假阳性）。
+    /// 注意：索引全量驻留内存时，这层过滤对 get 没有收益（见 Bloom 文档）；
+    /// 它是为 keydir 分区/落盘场景准备的负查询加速能力，也可用于外部批量校验。
+    pub fn may_contain(&self, key: impl AsRef<str>) -> bool {
+        let key = key.as_ref();
+        if self.shared.index.read().unwrap().contains_key(key) {
+            return true;
+        }
+        let kb = key.as_bytes();
+        let segments = self.shared.segments.read().unwrap();
+        // 没有 bloom 的分段无法排除 -> 保守返回 true
+        segments
+            .values()
+            .any(|s| s.bloom.as_ref().is_none_or(|b| b.may_contain(kb)))
     }
 
     /// 所有存活 key（BTreeMap 天然有序，无需额外排序）。
@@ -804,7 +993,7 @@ impl Bitcask {
         let segments = self.shared.segments.read().unwrap();
         let seg_bytes: u64 = segments
             .values()
-            .filter_map(|f| f.lock().unwrap().metadata().ok().map(|m| m.len()))
+            .filter_map(|s| s.file.lock().unwrap().metadata().ok().map(|m| m.len()))
             .sum();
         Stats {
             live_keys: index.len(),
@@ -812,6 +1001,7 @@ impl Bitcask {
             segment_count: segments.len(),
             total_bytes: seg_bytes + active_bytes,
             corrupt_tail_bytes: self.shared.corrupt_tail_bytes.load(Ordering::Relaxed),
+            bloom_count: segments.values().filter(|s| s.bloom.is_some()).count(),
         }
     }
 }
@@ -829,6 +1019,8 @@ pub struct Stats {
     pub total_bytes: u64,
     /// 打开时发现的损坏尾部字节数（已被截断丢弃，仅作报告用）
     pub corrupt_tail_bytes: u64,
+    /// 已加载布隆过滤器的分段数
+    pub bloom_count: usize,
 }
 
 #[cfg(test)]
@@ -1243,6 +1435,96 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(db.keys().len(), 20);
+    }
+
+    // ---------- v0.7：布隆过滤器 ----------
+
+    #[test]
+    fn test_bloom_no_false_negatives_and_low_fp_rate() {
+        let n = 10_000;
+        let mut bloom = Bloom::with_capacity(n, 0.01);
+        for i in 0..n {
+            bloom.insert(format!("key{i}").as_bytes());
+        }
+        // 无假阴性：插入过的 key 一定报"可能存在"
+        for i in 0..n {
+            assert!(bloom.may_contain(format!("key{i}").as_bytes()));
+        }
+        // 假阳性率应接近理论值（1%），给足余量避免抖动
+        let probes = 10_000;
+        let mut fp = 0;
+        for i in 0..probes {
+            if bloom.may_contain(format!("absent-{i}").as_bytes()) {
+                fp += 1;
+            }
+        }
+        let rate = fp as f64 / probes as f64;
+        assert!(rate < 0.03, "假阳性率过高: {rate:.4}（理论约 {:.4}）", bloom.fp_rate_estimate(n));
+    }
+
+    #[test]
+    fn test_bloom_serde_roundtrip() {
+        let mut bloom = Bloom::with_capacity(100, 0.01);
+        for i in 0..100 {
+            bloom.insert(format!("k{i}").as_bytes());
+        }
+        let bytes = bloom.to_bytes();
+        let restored = Bloom::from_bytes(&bytes).expect("应能反序列化");
+        for i in 0..100 {
+            assert!(restored.may_contain(format!("k{i}").as_bytes()));
+        }
+        // 损坏数据必须被拒绝（宁可没有 bloom，也不能误判）
+        assert!(Bloom::from_bytes(b"bad magic....").is_none());
+        assert!(Bloom::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn test_bloom_files_lifecycle() {
+        let dir = temp_dir("bloom-life");
+
+        {
+            let db = Bitcask::open(&dir).unwrap();
+            for i in 0..50u32 {
+                db.set(format!("key{i:02}"), "v").unwrap();
+            }
+            assert!(!db.may_contain("definitely-absent"));
+            db.merge().unwrap();
+
+            // merge 后应生成 bloom 文件，且 stats 反映出来
+            assert!(dir.join(bloom_file_name(1)).exists());
+            assert_eq!(db.stats().bloom_count, 1);
+            assert!(db.may_contain("key07"));
+            assert!(!db.may_contain("definitely-absent"));
+
+            // 第二次 merge：旧 bloom 应随旧分段一起清理
+            db.set("key00", "v2").unwrap();
+            db.merge().unwrap();
+            assert!(!dir.join(bloom_file_name(1)).exists());
+            assert!(dir.join(bloom_file_name(2)).exists());
+        }
+
+        // 重启后 bloom 应被恢复（不用重新 merge）
+        let db2 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db2.stats().bloom_count, 1);
+        assert!(db2.may_contain("key42"));
+        assert!(!db2.may_contain("nope-not-here"));
+    }
+
+    #[test]
+    fn test_bloom_missing_file_degrades_gracefully() {
+        let dir = temp_dir("bloom-miss");
+        {
+            let db = Bitcask::open(&dir).unwrap();
+            db.set("a", "1").unwrap();
+            db.merge().unwrap();
+        }
+        // 删掉 bloom 文件：引擎依然可用，只是 bloom_count 为 0
+        fs::remove_file(dir.join(bloom_file_name(1))).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
+        assert_eq!(db.stats().bloom_count, 0);
+        assert_eq!(db.get_string("a").unwrap().as_deref(), Some("1"));
+        // 没有 bloom 的分段无法排除任何 key -> 保守返回 true
+        assert!(db.may_contain("whatever"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # mini-bitcask
 
-> 用纯 Rust（零依赖，仅 std）实现的 Bitcask 风格 KV 存储引擎，核心约 820 行（含 20 个测试共 1376 行）。
+> 用纯 Rust（零依赖，仅 std）实现的 Bitcask 风格 KV 存储引擎，核心约 1010 行（含 24 个测试共 1659 行）。
 > 这是一个**学习型开源项目**：目标不是和 RocksDB 竞争，而是把「造存储引擎」的全过程开源出来。
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org/)
@@ -36,6 +36,7 @@ mydata/
 ├── active.log            唯一可写文件，append-only 追加新写入
 ├── segment-000001.log    只读分段（merge 产物，写完后永不修改）
 ├── hint-000001.log       分段的索引备份（key + 位置，不含 value），加速重启
+├── bloom-000001.filter   分段的布隆过滤器，用于负查询（可能不存在 -> 一定不存在）
 └── merge-000002.tmp      merge 中的临时文件，rename 后成为正式分段
 ```
 
@@ -135,7 +136,10 @@ merge 不是"原地覆写"，而是经典的三步走：
       单点读写 O(log n) 的代价，换来 key 天然有序、范围查询 `[a, b)`、前缀扫描；
       `range`/`scan_prefix` 先在索引读锁内收集 key（短持锁）再逐个取值，
       不阻塞写入且自动继承并发 merge 的重试逻辑
-- [ ] **v0.7 布隆过滤器**：每分段内嵌 bloom filter，未命中的 key 直接跳过磁盘读
+- [x] **v0.7 布隆过滤器**：每分段在 merge 时生成 `bloom-<id>.filter`（位图 + 双哈希，目标误判率 1%），
+      重启加载、随分段删除；提供 `may_contain()` 负查询 API。
+      **诚实说明**：keydir 全量驻留内存时 bloom 对 `get` 没有提速（索引本身就是精确过滤器），
+      它的价值在 merge 期判断与未来 keydir 分区/落盘场景 —— 与其假装是性能优化，不如把能力做完整
 - [ ] **v0.8 基准测试**：用 `criterion` 跑 set/get/range 压测，对比纯 BTreeMap 基线
 
 ## 相关阅读
