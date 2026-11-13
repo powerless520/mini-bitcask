@@ -1,0 +1,13 @@
+[package]
+name = "mini-bitcask"
+version = "0.2.0"
+edition = "2021"
+description = "A tiny Bitcask-style KV storage engine in pure Rust (learning project)"
+license = "MIT"
+
+[dependencies]
+# 故意保持零依赖 —— 用纯 std 实现全部功能
+
+[[bin]]
+name = "mini-bitcask"
+path = "src/main.rs"
