@@ -1,6 +1,6 @@
 # mini-bitcask
 
-> 用纯 Rust（零依赖，仅 std）实现的 Bitcask 风格 KV 存储引擎，核心不到 400 行。
+> 用纯 Rust（零依赖，仅 std）实现的 Bitcask 风格 KV 存储引擎，核心约 510 行（含 11 个测试共 747 行）。
 > 这是一个**学习型开源项目**：目标不是和 RocksDB 竞争，而是把「造存储引擎」的全过程开源出来。
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org/)
@@ -27,7 +27,18 @@ get("name")                            └────────────�
 ```
 
 代价是日志里会积累垃圾数据（旧版本值、墓碑），需要定期 **merge/compaction** ——
-这恰好是本项目 Roadmap 的第一个研究课题。
+这正是 v0.3 做的事。
+
+## 文件布局
+
+```
+mydata/
+├── active.log            唯一可写文件，append-only 追加新写入
+├── segment-000001.log    只读分段（merge 产物，写完后永不修改）
+└── merge-000002.tmp      merge 中的临时文件，rename 后成为正式分段
+```
+
+内存索引保存 `key -> (file_id, offset)`，读操作按位置直接 seek，一次 IO 拿到 value。
 
 ## 快速开始
 
@@ -40,20 +51,41 @@ cargo run -- ./mydata
 ```
 
 ```
-> set name cyrus
-OK (key=name)
-> get name
-cyrus
+> set user alice
+OK (key=user)
+> set user bob
+OK (key=user)
+> set lang rust
+OK (key=lang)
 > stats
-live_keys=1 log_bytes=30 (~0.0 KiB)
+live_keys=2 total_bytes=104 (~0.1 KiB) segments=0 active=104 B
+> merge
+merge 完成: 104 B -> 41 B (压缩到 39.4%)
+> get user
+bob
 > exit
 ```
+
+## Merger 的崩溃安全性
+
+merge 不是"原地覆写"，而是经典的三步走：
+
+1. **写临时文件** `merge-<id>.tmp`，逐条重写存活数据 + `fsync`
+2. **原子 rename** 成 `segment-<id>.log`（同一文件系统内 rename 是原子的）
+3. **删除旧分段 + 截断 active.log**
+
+任何时刻崩溃都安全：
+
+| 崩溃时机 | 结果 |
+|---------|------|
+| rename 之前 | 旧文件完好，临时文件下次启动时被自动清理 |
+| rename 之后、删除之前 | 新旧文件并存，重放按分段 id 升序 + active 最后，新分段数据覆盖旧数据，结果正确 |
 
 ## 代码导读
 
 | 文件 | 内容 | 学习点 |
 |------|------|--------|
-| `src/lib.rs` | 引擎核心 | append-only 文件设计、二进制协议编码、日志重放、`O_APPEND` 偏移量陷阱 |
+| `src/lib.rs` | 引擎核心 | append-only 文件设计、二进制协议编码、CRC 校验、多文件 merge、`O_APPEND` 偏移量陷阱 |
 | `src/main.rs` | REPL CLI | `std::io` 交互、错误处理 |
 
 刻意保留的教学性设计：
@@ -64,11 +96,13 @@ live_keys=1 log_bytes=30 (~0.0 KiB)
 
 ## Roadmap（每个课题都是一个独立 PR）
 
-- [x] **v0.2 CRC 校验**（已实现）：每条 entry 前置 4 字节 CRC-32（手写查表法，零依赖），
+- [x] **v0.2 CRC 校验**：每条 entry 前置 4 字节 CRC-32（手写查表法，零依赖），
       重放时逐条校验；损坏尾部直接截断丢弃，保证索引永远指向完整记录。
       实测教训：截断是必须的 —— 否则 O_APPEND 会把新记录写到损坏数据之后，下次重放仍会在损坏处停止，新数据永远不可见
-- [ ] **v0.3 Merge/Compaction**：新开只读文件 + active 文件，把存活数据重写进新文件，删除垃圾 —— 学习 Bitcask 论文 §3
-- [ ] **v0.4 多文件 + hint file**：日志切分、merge 时生成 hint file 加速重启
+- [x] **v0.3 Merge/Compaction**：active.log + 只读分段的多文件布局；
+      存活数据重写进新分段 → 原子 rename → 删除旧文件（Bitcask 论文 §3）。
+      实测：10 轮覆盖写后 merge，104 B → 41 B，压缩到 39.4%
+- [ ] **v0.4 Hint file**：merge 时顺便生成 hint file（key + 位置，不含 value），重启时不必扫描全量数据、直接建索引
 - [ ] **v0.5 并发句柄**：`Arc<RwLock<Bitcask>>` 或多 reader 单 writer（Bitcask 原文的设计）
 - [ ] **v0.6 索引优化**：keydir 换成 `BTreeMap` 支持范围查询 / 尝试内嵌布隆过滤器
 - [ ] **v0.7 基准测试**：用 `criterion` 跑 set/get 压测，对比纯 HashMap 基线

@@ -8,7 +8,8 @@
 //!   get <key>           读取
 //!   del <key>           删除
 //!   list                列出所有 key
-//!   stats               查看统计（key 数 / 日志字节数）
+//!   stats               查看统计（key 数 / 总字节数 / 分段数）
+//!   merge               合并压缩（把存活数据重写进新分段，删除垃圾）
 //!   exit                退出（自动 flush）
 
 use mini_bitcask::Bitcask;
@@ -34,8 +35,8 @@ fn main() {
         }
     };
 
-    println!("mini-bitcask v0.1 (dir: {})", dir.display());
-    println!("命令: set <k> <v> | get <k> | del <k> | list | stats | exit");
+    println!("mini-bitcask v0.3 (dir: {})", dir.display());
+    println!("命令: set <k> <v> | get <k> | del <k> | list | stats | merge | exit");
     println!("共 {} 个 key 从日志中恢复", db.len());
 
     let stdin = io::stdin();
@@ -76,10 +77,12 @@ fn main() {
             ("stats", "", _) => {
                 let s = db.stats();
                 let mut out = format!(
-                    "live_keys={} log_bytes={} (~{:.1} KiB)",
+                    "live_keys={} total_bytes={} (~{:.1} KiB) segments={} active={} B",
                     s.live_keys,
-                    s.log_bytes,
-                    s.log_bytes as f64 / 1024.0
+                    s.total_bytes,
+                    s.total_bytes as f64 / 1024.0,
+                    s.segment_count,
+                    s.active_bytes
                 );
                 if s.corrupt_tail_bytes > 0 {
                     out.push_str(&format!(
@@ -89,6 +92,14 @@ fn main() {
                 }
                 Ok(out)
             }
+            ("merge", "", _) => db.merge().map(|(before, after)| {
+                let ratio = if before > 0 {
+                    after as f64 / before as f64 * 100.0
+                } else {
+                    100.0
+                };
+                format!("merge 完成: {before} B -> {after} B (压缩到 {ratio:.1}%)")
+            }),
             ("exit", "", _) | ("quit", "", _) => {
                 let _ = db.sync();
                 println!("bye");
@@ -96,7 +107,7 @@ fn main() {
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "未知命令，支持: set <k> <v> / get <k> / del <k> / list / stats / exit",
+                "未知命令，支持: set <k> <v> / get <k> / del <k> / list / stats / merge / exit",
             )),
         };
 
