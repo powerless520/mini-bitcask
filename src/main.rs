@@ -38,7 +38,7 @@ fn main() {
         }
     };
 
-    println!("mini-bitcask v0.7 (dir: {})", dir.display());
+    println!("mini-bitcask v0.8 (dir: {})", dir.display());
     println!("命令: set <k> <v> | get <k> | del <k> | list | stats");
     println!("      merge | range <a> <b> | prefix <p> | bloom <k> | exit");
     println!("共 {} 个 key 从日志中恢复", db.len());
@@ -70,12 +70,10 @@ fn main() {
             ("set", k, v) if !k.is_empty() && !v.is_empty() => {
                 db.set(k, v).map(|_| format!("OK (key={k})"))
             }
-            ("get", k, _) if !k.is_empty() => db
-                .get_string(k)
-                .map(|v| match v {
-                    Some(s) => s,
-                    None => "(nil)".to_string(),
-                }),
+            ("get", k, _) if !k.is_empty() => db.get_string(k).map(|v| match v {
+                Some(s) => s,
+                None => "(nil)".to_string(),
+            }),
             ("del", k, _) if !k.is_empty() => db.delete(k).map(|_| "OK".to_string()),
             ("list", "", _) => Ok(db.keys().join("\n")),
             ("stats", "", _) => {
@@ -108,9 +106,7 @@ fn main() {
             ("range", start, end) if !start.is_empty() && !end.is_empty() => {
                 db.range(start, end).map(|rows| format_rows(&rows))
             }
-            ("prefix", p, _) if !p.is_empty() => {
-                db.scan_prefix(p).map(|rows| format_rows(&rows))
-            }
+            ("prefix", p, _) if !p.is_empty() => db.scan_prefix(p).map(|rows| format_rows(&rows)),
             ("bloom", k, _) if !k.is_empty() => Ok(if db.contains_key(k) {
                 format!("{k}: 存在（精确命中内存索引）")
             } else if db.may_contain(k) {

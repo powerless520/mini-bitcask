@@ -236,14 +236,12 @@ fn load_index_from_hint(
         if !try_hint_read!(&mut header) {
             return Ok(true); // 干净 EOF：整个 hint 有效
         }
-        let key_len =
-            u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-        let _value_len =
-            u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let key_len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let _value_len = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
         let entry_len = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
         let offset = u64::from_be_bytes([
-            header[12], header[13], header[14], header[15], header[16], header[17],
-            header[18], header[19],
+            header[12], header[13], header[14], header[15], header[16], header[17], header[18],
+            header[19],
         ]);
 
         const MAX_KEY: usize = 1 << 20;
@@ -536,7 +534,11 @@ impl Bitcask {
         // 这样"后写覆盖先写"的语义在重启后依然成立
         let (valid, corrupt) = {
             let mut active = db.shared.active.lock().unwrap();
-            let r = Self::replay_file(&mut active.reader, ACTIVE_FILE_ID, &mut db.shared.index.write().unwrap())?;
+            let r = Self::replay_file(
+                &mut active.reader,
+                ACTIVE_FILE_ID,
+                &mut db.shared.index.write().unwrap(),
+            )?;
             r
         };
         db.shared
@@ -555,11 +557,7 @@ impl Bitcask {
 
     /// 重放单个文件的全部 entry，把索引写进 `index`。
     /// 返回 (有效字节数, 损坏尾部字节数)。
-    fn replay_file(
-        file: &mut File,
-        file_id: u64,
-        index: &mut KeyDir,
-    ) -> io::Result<(u64, u64)> {
+    fn replay_file(file: &mut File, file_id: u64, index: &mut KeyDir) -> io::Result<(u64, u64)> {
         let mut offset: u64 = 0;
         loop {
             match Self::read_entry_at(file, offset) {
@@ -605,7 +603,9 @@ impl Bitcask {
         const MAX_KEY: usize = 1 << 20; // 1 MiB
         const MAX_VALUE: usize = 64 << 20; // 64 MiB
         if key_len > MAX_KEY || value_len > MAX_VALUE {
-            return Err(invalid_data("corrupt entry: key/value length exceeds limit"));
+            return Err(invalid_data(
+                "corrupt entry: key/value length exceeds limit",
+            ));
         }
 
         // payload = key_len+flag+value_len 这 9 字节 + key + value（crc 覆盖它全部）
@@ -638,11 +638,13 @@ impl Bitcask {
         let offset = active.bytes;
         active.writer.write_all(&entry)?;
         active.bytes += entry.len() as u64;
-        self.shared
-            .index
-            .write()
-            .unwrap()
-            .insert(key, ValuePos { file_id: ACTIVE_FILE_ID, offset });
+        self.shared.index.write().unwrap().insert(
+            key,
+            ValuePos {
+                file_id: ACTIVE_FILE_ID,
+                offset,
+            },
+        );
         Ok(())
     }
 
@@ -730,7 +732,9 @@ impl Bitcask {
                 }
             }
         }
-        Err(invalid_data("get: too many retries (concurrent merge storm?)"))
+        Err(invalid_data(
+            "get: too many retries (concurrent merge storm?)",
+        ))
     }
 
     /// 便捷方法：读取并转成 UTF-8 字符串（demo/CLI 用）。
@@ -791,9 +795,18 @@ impl Bitcask {
         }
 
         let new_id = self.shared.next_segment_id.load(Ordering::Relaxed);
-        let tmp_path = self.shared.dir.join(format!("{MERGE_TMP_PREFIX}{new_id:06}.tmp"));
-        let hint_tmp_path = self.shared.dir.join(format!("{HINT_PREFIX}{new_id:06}.tmp"));
-        let bloom_tmp_path = self.shared.dir.join(format!("{BLOOM_PREFIX}{new_id:06}.tmp"));
+        let tmp_path = self
+            .shared
+            .dir
+            .join(format!("{MERGE_TMP_PREFIX}{new_id:06}.tmp"));
+        let hint_tmp_path = self
+            .shared
+            .dir
+            .join(format!("{HINT_PREFIX}{new_id:06}.tmp"));
+        let bloom_tmp_path = self
+            .shared
+            .dir
+            .join(format!("{BLOOM_PREFIX}{new_id:06}.tmp"));
         let final_path = self.shared.dir.join(segment_file_name(new_id));
         let hint_final_path = self.shared.dir.join(hint_file_name(new_id));
         let bloom_final_path = self.shared.dir.join(bloom_file_name(new_id));
@@ -1382,7 +1395,12 @@ mod tests {
 
         // 删除后范围查询即时反映
         db.delete("c").unwrap();
-        let keys: Vec<String> = db.range("b", "e").unwrap().into_iter().map(|(k, _)| k).collect();
+        let keys: Vec<String> = db
+            .range("b", "e")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         assert_eq!(keys, vec!["b".to_string(), "d".to_string()]);
     }
 
@@ -1459,7 +1477,11 @@ mod tests {
             }
         }
         let rate = fp as f64 / probes as f64;
-        assert!(rate < 0.03, "假阳性率过高: {rate:.4}（理论约 {:.4}）", bloom.fp_rate_estimate(n));
+        assert!(
+            rate < 0.03,
+            "假阳性率过高: {rate:.4}（理论约 {:.4}）",
+            bloom.fp_rate_estimate(n)
+        );
     }
 
     #[test]
@@ -1554,7 +1576,8 @@ mod tests {
             let db = db.clone();
             thread::spawn(move || {
                 for i in 0..2000u32 {
-                    db.set(format!("key{i:04}"), format!("value{i:04}")).unwrap();
+                    db.set(format!("key{i:04}"), format!("value{i:04}"))
+                        .unwrap();
                 }
             })
         };
@@ -1599,14 +1622,16 @@ mod tests {
 
         // 预置数据，随后一边写、一边反复 merge、一边读
         for i in 0..200u32 {
-            db.set(format!("key{i:04}"), format!("value{i:04}")).unwrap();
+            db.set(format!("key{i:04}"), format!("value{i:04}"))
+                .unwrap();
         }
 
         let writer = {
             let db = db.clone();
             thread::spawn(move || {
                 for i in 200..600u32 {
-                    db.set(format!("key{i:04}"), format!("value{i:04}")).unwrap();
+                    db.set(format!("key{i:04}"), format!("value{i:04}"))
+                        .unwrap();
                 }
             })
         };

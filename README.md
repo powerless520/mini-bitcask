@@ -1,6 +1,6 @@
 # mini-bitcask
 
-> 用纯 Rust（零依赖，仅 std）实现的 Bitcask 风格 KV 存储引擎，核心约 1010 行（含 24 个测试共 1659 行）。
+> 用纯 Rust（零依赖，仅 std）实现的 Bitcask 风格 KV 存储引擎，核心约 1020 行（含 24 个测试共 1665 行）。
 > 这是一个**学习型开源项目**：目标不是和 RocksDB 竞争，而是把「造存储引擎」的全过程开源出来。
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org/)
@@ -73,6 +73,10 @@ cargo run -- ./mydata
 ```
 
 ```
+mini-bitcask v0.8 (dir: ./mydata)
+命令: set <k> <v> | get <k> | del <k> | list | stats
+      merge | range <a> <b> | prefix <p> | bloom <k> | exit
+共 0 个 key 从日志中恢复
 > set user alice
 OK (key=user)
 > set user bob
@@ -80,12 +84,15 @@ OK (key=user)
 > set lang rust
 OK (key=lang)
 > stats
-live_keys=2 total_bytes=104 (~0.1 KiB) segments=0 active=104 B
+live_keys=2 total_bytes=63 (~0.1 KiB) segments=0 active=63 B blooms=0
 > merge
-merge 完成: 104 B -> 41 B (压缩到 39.4%)
+merge 完成: 63 B -> 41 B (压缩到 65.1%)
 > get user
 bob
+> prefix l
+lang = rust
 > exit
+bye
 ```
 
 ## Merger 的崩溃安全性
@@ -109,6 +116,7 @@ merge 不是"原地覆写"，而是经典的三步走：
 |------|------|--------|
 | `src/lib.rs` | 引擎核心 | append-only 文件设计、二进制协议编码、CRC 校验、多文件 merge、`O_APPEND` 偏移量陷阱 |
 | `src/main.rs` | REPL CLI | `std::io` 交互、错误处理 |
+| `examples/bench.rs` | 零依赖基准 | 手写计时、`black_box` 防优化、和内存基线对打的方法论 |
 
 刻意保留的教学性设计：
 
@@ -140,7 +148,56 @@ merge 不是"原地覆写"，而是经典的三步走：
       重启加载、随分段删除；提供 `may_contain()` 负查询 API。
       **诚实说明**：keydir 全量驻留内存时 bloom 对 `get` 没有提速（索引本身就是精确过滤器），
       它的价值在 merge 期判断与未来 keydir 分区/落盘场景 —— 与其假装是性能优化，不如把能力做完整
-- [ ] **v0.8 基准测试**：用 `criterion` 跑 set/get/range 压测，对比纯 BTreeMap 基线
+- [x] **v0.8 基准测试**：`examples/bench.rs` 手写零依赖基准，量化 set/get/range 吞吐并对比纯 BTreeMap 基线；
+      merge 压缩比与 hint 重启耗时同场测量。
+      **诚实说明**：`criterion` 会引入约 50 个传递依赖，与「零依赖」的立身之本冲突，因此选择手写基准 ——
+      代价是没有置信区间，这个代价在 README 里明确写出来而不是藏起来
+
+## 基准测试
+
+```bash
+cargo run --release --example bench
+```
+
+零依赖的手写基准（不是 `criterion`）——理由见下文「为什么不用 criterion」。
+10 万 key × 128 B value（约 14.1 MB），每组都和纯 `BTreeMap<Vec<u8>, Vec<u8>>` 基线对打：
+
+```
+顺序写入 set                 535 ns/op     1868363 ops/s   | BTreeMap 基线     132 ns/op（4.0x）
+随机读 get                 1716 ns/op      582899 ops/s   | BTreeMap 基线     195 ns/op（8.8x）
+范围扫描 range              1262 ns/op      792226 ops/s   | BTreeMap 基线      19 ns/op（66.0x）
+
+merge 压缩
+  耗时 136.35ms，16.9 MB -> 2.6 MB（压缩到 15.3%）
+  存活 key 100000，分段数 0 -> 1，布隆过滤器 1 个
+
+重启加载（hint 快速路径）
+  11.65ms（100000 keys，2.57 MB 分段）
+```
+
+怎么读这些数字（倍数给区间，因为单次运行本身就有抖动）：
+
+| 指标 | 典型差距 | 差距来源 |
+|------|---------|---------|
+| `set` | 3–4x | 多了一次 `write` 系统调用 + CRC 计算 + 索引双锁（active + index）。绝对开销约 400 ns/op，这是「持久化」的价格，不是实现缺陷 |
+| `get` | 9–13x | 每个值都要 `pread` 一次。内存基线是纯 memcpy，而这里是真的访问了文件系统。即便有页缓存仍差一个数量级，说明**内存索引 + 磁盘取值**这个模型的读放大是实打实的 |
+| `range` | 66–71x | 这是设计取舍的代价：`range` 先在索引读锁内收集 key（很便宜），再对**每一行**调用 `get()` 取值（索引查找 + `pread`）。换来的是不长时间持锁阻塞写入，以及自动继承并发 merge 的 key 校验重试逻辑。想要快就得顺序读整段文件并跳过失效条目 —— 那是另一种权衡 |
+
+诚实提示：
+
+- **单次运行、无置信区间**。同一份代码连跑三次，随机读在 1.5–2.5 μs 之间波动
+  （对应 8.8x–12.8x），这是调度与页缓存状态的噪声，不是实现不稳定。
+  想要统计显著性请自己多跑几轮取中位数。
+- **全是页缓存热态**。冷启动（首次读盘）会慢一到两个数量级，这个基准测不出来。
+- `merge` 的 15.3% 不是「压缩率」，是**存活数据占比**——本例每个 key 只写过 2 版左右，
+  如果反复覆盖写同一批 key，这个比例会低到个位数。
+
+### 为什么不用 criterion
+
+`criterion` 是 Rust 基准测试的事实标准，但它会拉进约 50 个传递依赖，
+而本项目的立身之本是「零依赖，`cargo build` 不需要网络」。为了一个学习项目的性能数字
+破坏这个约束不划算。手写基准的代价是少了统计严谨性 —— 我选择把这个代价明确写出来，
+而不是假装它不存在。
 
 ## 相关阅读
 
