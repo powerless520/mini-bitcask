@@ -588,6 +588,7 @@ impl Bitcask {
     ///   1. 写入 merge-<id>.tmp 与 hint 临时文件并 fsync
     ///   2. 原子 rename 成 segment-<id>.log（先数据后 hint）
     ///   3. 删除旧分段 + 截断 active.log
+    ///
     /// 任何时刻崩溃，重启后数据都完整（见文件头注释）。
     ///
     /// 返回 (合并前字节数, 合并后字节数)。
