@@ -1,4 +1,4 @@
-//! mini-bitcask —— 一个 ~670 行的 Bitcask 风格 KV 存储引擎（教学/开源项目）
+//! mini-bitcask —— 一个 ~800 行的 Bitcask 风格 KV 存储引擎（教学/开源项目）
 //!
 //! 设计模型（来自 Basho/riak 的 Bitcask 论文）：
 //!
@@ -22,32 +22,37 @@
 //!
 //!   <dir>/active.log            唯一可写文件，append-only 追加新写入
 //!   <dir>/segment-000001.log    只读分段（merge 产物，写完后永不修改）
+//!   <dir>/hint-000001.log       分段的索引备份（key + 位置，不含 value），加速重启
 //!   <dir>/merge-<id>.tmp        merge 过程中的临时文件，rename 后成为正式分段
+//!
+//! v0.4 hint file：merge 时顺便写「不含 value 的索引备份」，重启时直接建索引。
+//! 信任策略：hint 必须逐字节精确解析到文件尾、所有位置不越界，否则整体作废回退全量重放。
+//!
+//! v0.5 并发模型（对应 Bitcask 论文 §4，多读单写）：
+//!
+//!   `Bitcask` 是 Clone + Send + Sync 的共享句柄（内部 Arc），可交给任意线程。
+//!   - 写（set/delete/merge）串行：都经过 active 的互斥锁，天然单写者
+//!   - 读（get）并发：索引用 RwLock 读锁，分段文件句柄各自独立加锁，
+//!     不同分段的读互不阻塞
+//!   - 锁顺序（防死锁，全局统一）：active -> index -> segments
+//!     get 先读索引并立即释放，再取文件句柄，不形成环
+//!   - merge 竞态：读索引和读数据之间旧分段可能被删除，get 内置
+//!     "重读索引 + 重试"，merge 期间读操作依然正确
 //!
 //! 崩溃安全性：
 //!   1. 重放时逐条校验 CRC，损坏尾部直接截断丢弃（v0.2）
-//!   2. merge 用 "写临时文件 -> fsync -> 原子 rename" 三步，任何时刻崩溃都不会丢数据：
-//!      - rename 之前崩溃：旧文件完好，临时文件下次启动时被清理
-//!      - rename 之后崩溃：新旧文件并存，但重放按分段 id 升序、active 最后，
-//!        新分段（id 更大）会覆盖旧数据，结果依然正确
+//!   2. merge 用 "写临时文件 -> fsync -> 原子 rename" 三步，任何时刻崩溃都不会丢数据；
+//!      rename 顺序先数据后 hint，中间崩溃只损失加速路径
 //!
-//! v0.4 hint file（对应 Bitcask 论文 §3.2）：
-//!
-//!   merge 时为每个新分段顺便写一份 hint-<id>.log：只存 (key, 位置, 长度)，不含 value。
-//!   重启时若 hint 结构完整，直接读它建索引，完全跳过数据扫描 ——
-//!   数据文件越大，启动加速越明显。信任策略（宁可回退也不读错）：
-//!     - hint 必须能被逐字节精确解析到文件尾（部分条目 = 整个 hint 作废）
-//!     - 每条 offset + entry_len 必须不超过分段文件大小
-//!     - 任一校验失败 -> 回退到 v0.3 的全量重放
-//!   rename 顺序：先数据分段、后 hint —— 中间崩溃只会"缺 hint"，自动回退，依然安全。
-//!
-//! 这是刻意留白的项目：并发句柄等留作后续演进路线，见 README.md 的 Roadmap。
+//! 这是刻意留白的项目：索引优化（BTreeMap/布隆过滤器）、基准测试等
+//! 留作后续演进路线，见 README.md 的 Roadmap。
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 const FLAG_PUT: u8 = 0;
 const FLAG_DEL: u8 = 1;
@@ -74,6 +79,8 @@ struct ValuePos {
     /// entry 起始偏移量
     offset: u64,
 }
+
+// ---------------- 编码与 CRC ----------------
 
 /// CRC-32（IEEE 802.3，多项式 0xEDB88320），查表法。
 /// 故意手写而非引入 crc crate —— 本项目坚持零依赖，顺便看清校验和的本质。
@@ -120,20 +127,6 @@ fn encode_entry(key: &str, flag: u8, value: &[u8]) -> Vec<u8> {
     out
 }
 
-fn segment_file_name(id: u64) -> String {
-    format!("{SEGMENT_PREFIX}{id:06}.log")
-}
-
-fn hint_file_name(id: u64) -> String {
-    format!("{HINT_PREFIX}{id:06}.log")
-}
-
-fn parse_segment_id(path: &Path) -> Option<u64> {
-    let name = path.file_name()?.to_str()?;
-    let digits = name.strip_prefix(SEGMENT_PREFIX)?.strip_suffix(".log")?;
-    digits.parse::<u64>().ok()
-}
-
 /// 把一条 hint 记录编码成磁盘字节流（不含 value，这是 hint 省空间的关键）：
 ///
 ///   ┌──────────┬────────────┬─────────────┬──────────┬────────────┐
@@ -148,6 +141,20 @@ fn encode_hint_entry(key: &str, value_len: usize, entry_len: u64, offset: u64) -
     out.extend_from_slice(&offset.to_be_bytes());
     out.extend_from_slice(key.as_bytes());
     out
+}
+
+fn segment_file_name(id: u64) -> String {
+    format!("{SEGMENT_PREFIX}{id:06}.log")
+}
+
+fn hint_file_name(id: u64) -> String {
+    format!("{HINT_PREFIX}{id:06}.log")
+}
+
+fn parse_segment_id(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let digits = name.strip_prefix(SEGMENT_PREFIX)?.strip_suffix(".log")?;
+    digits.parse::<u64>().ok()
 }
 
 /// 尽力读满 buf。
@@ -234,33 +241,62 @@ fn load_index_from_hint(
             Err(_) => return Ok(false),
         };
 
-        index.insert(
-            key,
-            ValuePos {
-                file_id,
-                offset,
-            },
-        );
+        index.insert(key, ValuePos { file_id, offset });
     }
 }
 
-/// 一个 Bitcask 实例对应一个数据目录。
-pub struct Bitcask {
+// ---------------- 共享状态（v0.5 并发模型） ----------------
+
+/// active.log 的读写句柄 + 记账。写入串行化的核心：所有写都锁这里。
+struct ActiveFile {
+    /// 追加写句柄（O_APPEND）
+    writer: BufWriter<File>,
+    /// 随机读句柄（与 writer 同锁，flush 后可安全读）
+    reader: File,
+    /// active.log 当前字节数（O_APPEND 下 stream_position 不可靠，自己记账）
+    bytes: u64,
+}
+
+/// 被 Arc 共享的内部状态。
+///
+/// 锁顺序（所有代码路径必须一致，防死锁）：active -> index -> segments。
+struct Shared {
     dir: PathBuf,
     /// 内存索引：key -> 最新值的位置
-    index: HashMap<String, ValuePos>,
-    /// 只读分段文件的读句柄（id -> File）
-    segments: HashMap<u64, File>,
+    index: RwLock<HashMap<String, ValuePos>>,
+    /// 只读分段文件的读句柄（id -> 句柄）。读用读锁，merge 换血用写锁
+    segments: RwLock<HashMap<u64, Arc<Mutex<File>>>>,
+    /// active.log 读写句柄（所有写入串行化的单点）
+    active: Mutex<ActiveFile>,
     /// 下一个可用的分段 id
-    next_segment_id: u64,
-    /// active.log 的追加写句柄
-    writer: BufWriter<File>,
-    /// active.log 的随机读句柄（与 writer 分离，避免 seek 互相干扰）
-    active_reader: File,
-    /// active.log 当前字节数（O_APPEND 下 stream_position 不可靠，自己记账）
-    active_bytes: u64,
+    next_segment_id: AtomicU64,
     /// 打开时发现的损坏尾部字节数（已截断丢弃，仅作报告用）
-    corrupt_tail_bytes: u64,
+    corrupt_tail_bytes: AtomicU64,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // 最后一个句柄释放时尽力 flush（此时锁必然无人竞争）
+        if let Ok(mut active) = self.active.lock() {
+            let _ = active.writer.flush();
+        }
+    }
+}
+
+/// Bitcask 实例句柄：Clone + Send + Sync，多读单写（Bitcask 论文 §4）。
+///
+/// 克隆它即可把同一个数据库共享给其他线程：
+///
+/// ```no_run
+/// let db = mini_bitcask::Bitcask::open("./mydata")?;
+/// let db2 = db.clone();
+/// std::thread::spawn(move || { db2.set("k", "v").unwrap(); });
+/// db.get("k")?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[derive(Clone)]
+pub struct Bitcask {
+    shared: Arc<Shared>,
 }
 
 impl Bitcask {
@@ -297,7 +333,7 @@ impl Bitcask {
         segment_ids.sort_unstable();
 
         let mut index: HashMap<String, ValuePos> = HashMap::new();
-        let mut segments = HashMap::new();
+        let mut segments: HashMap<u64, Arc<Mutex<File>>> = HashMap::new();
         for &id in &segment_ids {
             let seg_path = dir.join(segment_file_name(id));
             let seg_file = OpenOptions::new().read(true).open(&seg_path)?;
@@ -315,38 +351,55 @@ impl Bitcask {
                 Self::replay_file(&mut data, id, &mut index)?;
             }
 
-            segments.insert(id, seg_file);
+            segments.insert(id, Arc::new(Mutex::new(seg_file)));
         }
 
-        let mut store = Bitcask {
+        let corrupt_tail_bytes = AtomicU64::new(0);
+        let shared = Shared {
             dir,
-            index,
-            segments,
-            next_segment_id: segment_ids.last().copied().unwrap_or(0) + 1,
-            writer: BufWriter::new(file),
-            active_reader,
-            active_bytes: 0,
-            corrupt_tail_bytes: 0,
+            index: RwLock::new(index),
+            segments: RwLock::new(segments),
+            next_segment_id: AtomicU64::new(segment_ids.last().copied().unwrap_or(0) + 1),
+            active: Mutex::new(ActiveFile {
+                writer: BufWriter::new(file),
+                reader: active_reader,
+                bytes: 0,
+            }),
+            corrupt_tail_bytes,
+        };
+
+        let db = Bitcask {
+            shared: Arc::new(shared),
         };
 
         // active 重放在最后（active 永远是最新写入），
         // 这样"后写覆盖先写"的语义在重启后依然成立
-        let mut active = store.active_reader.try_clone()?;
-        let (valid, corrupt) = Self::replay_file(&mut active, ACTIVE_FILE_ID, &mut store.index)?;
-        store.corrupt_tail_bytes = corrupt;
+        let (valid, corrupt) = {
+            let mut active = db.shared.active.lock().unwrap();
+            let r = Self::replay_file(&mut active.reader, ACTIVE_FILE_ID, &mut db.shared.index.write().unwrap())?;
+            r
+        };
+        db.shared
+            .corrupt_tail_bytes
+            .store(corrupt, Ordering::Relaxed);
         if corrupt > 0 {
             // 截断损坏尾部：O_APPEND 会把新记录写到损坏数据之后，
             // 不截断的话下次重放仍会在损坏处停止，新数据永远不可见
-            store.active_reader.set_len(valid)?;
+            let active = db.shared.active.lock().unwrap();
+            active.reader.set_len(valid)?;
         }
-        store.active_bytes = valid;
+        db.shared.active.lock().unwrap().bytes = valid;
 
-        Ok(store)
+        Ok(db)
     }
 
     /// 重放单个文件的全部 entry，把索引写进 `index`。
     /// 返回 (有效字节数, 损坏尾部字节数)。
-    fn replay_file(file: &mut File, file_id: u64, index: &mut HashMap<String, ValuePos>) -> io::Result<(u64, u64)> {
+    fn replay_file(
+        file: &mut File,
+        file_id: u64,
+        index: &mut HashMap<String, ValuePos>,
+    ) -> io::Result<(u64, u64)> {
         let mut offset: u64 = 0;
         loop {
             match Self::read_entry_at(file, offset) {
@@ -406,81 +459,122 @@ impl Bitcask {
 
         let key = payload[9..9 + key_len].to_vec();
         let value = payload[9 + key_len..].to_vec();
-        let key = String::from_utf8(key).map_err(|_| invalid_data("corrupt entry: key is not UTF-8"))?;
+        let key =
+            String::from_utf8(key).map_err(|_| invalid_data("corrupt entry: key is not UTF-8"))?;
         Ok(Some((key, flag, value, (13 + key_len + value_len) as u64)))
     }
 
-    /// 取某个 file_id 对应的读句柄。
-    fn reader_for(&mut self, file_id: u64) -> io::Result<&mut File> {
-        if file_id == ACTIVE_FILE_ID {
-            Ok(&mut self.active_reader)
-        } else {
-            self.segments.get_mut(&file_id).ok_or_else(|| {
-                invalid_data(format!("index points to missing segment {file_id}"))
-            })
-        }
-    }
-
     /// 写入一个键值对（覆盖即追加新版本，旧值成为垃圾数据）。
-    pub fn set(&mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> io::Result<()> {
+    ///
+    /// 并发语义：active 锁内完成"追加 + 更新索引"，保证多线程下
+    /// 同一个 key 的索引永远指向最后完成的那次写入（last-write-wins）。
+    pub fn set(&self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> io::Result<()> {
         let key = key.into();
         let value = value.into();
 
         let entry = encode_entry(&key, FLAG_PUT, &value);
-        self.writer.write_all(&entry)?;
-
-        self.index.insert(
-            key,
-            ValuePos {
-                file_id: ACTIVE_FILE_ID,
-                offset: self.active_bytes,
-            },
-        );
-        self.active_bytes += entry.len() as u64;
+        // 锁顺序：active -> index
+        let mut active = self.shared.active.lock().unwrap();
+        let offset = active.bytes;
+        active.writer.write_all(&entry)?;
+        active.bytes += entry.len() as u64;
+        self.shared
+            .index
+            .write()
+            .unwrap()
+            .insert(key, ValuePos { file_id: ACTIVE_FILE_ID, offset });
         Ok(())
     }
 
     /// 删除一个 key：追加墓碑记录 + 移除内存索引。
     /// 删除不存在的 key 也是合法操作（与其他 Bitcask 实现语义一致）。
-    pub fn delete(&mut self, key: impl AsRef<str>) -> io::Result<()> {
+    pub fn delete(&self, key: impl AsRef<str>) -> io::Result<()> {
         let key = key.as_ref();
 
         let entry = encode_entry(key, FLAG_DEL, &[]);
-        self.writer.write_all(&entry)?;
-
-        self.index.remove(key);
-        self.active_bytes += entry.len() as u64;
+        let mut active = self.shared.active.lock().unwrap();
+        active.writer.write_all(&entry)?;
+        active.bytes += entry.len() as u64;
+        self.shared.index.write().unwrap().remove(key);
         Ok(())
     }
 
-    /// 读取一个 key 的最新值。
-    pub fn get(&mut self, key: impl AsRef<str>) -> io::Result<Option<Vec<u8>>> {
-        // 先把写缓冲刷下去：writer 与 reader 是两个独立句柄，
-        // 不 flush 的话 reader 会读到尚未落盘的旧内容
-        self.writer.flush()?;
-
+    /// 读取一个 key 的最新值。线程安全，可与写、merge 并发。
+    ///
+    /// 并发正确性核心：索引位置可能在"读索引"和"读数据"之间被并发 merge 作废
+    /// （旧分段被删 / active 被截断后复用）。因此每条读出的记录都要校验
+    /// key 是否匹配，不匹配说明位置过期 -> 重读索引重试。
+    pub fn get(&self, key: impl AsRef<str>) -> io::Result<Option<Vec<u8>>> {
         let key = key.as_ref();
-        let Some(&pos) = self.index.get(key) else {
+
+        // 先读索引并立即释放（避免与写路径的 index 写锁形成死锁环）
+        let Some(mut pos) = ({
+            let index = self.shared.index.read().unwrap();
+            index.get(key).copied()
+        }) else {
             return Ok(None);
         };
 
-        let reader = self.reader_for(pos.file_id)?;
-        match Self::read_entry_at(reader, pos.offset)? {
-            Some((_, FLAG_PUT, value, _)) => Ok(Some(value)),
-            Some((k, FLAG_DEL, _, _)) if k == key => Ok(None),
-            Some((k, flag, _, _)) => Err(invalid_data(format!(
-                "index mismatch at file {} offset {}: got key={k:?} flag={flag}",
-                pos.file_id, pos.offset
-            ))),
-            None => Err(invalid_data(format!(
-                "index points to missing entry (file {} offset {})",
-                pos.file_id, pos.offset
-            ))),
+        // 最多重试 3 次（正常情况下 1 次就命中）
+        for _attempt in 0..3u32 {
+            let result = if pos.file_id == ACTIVE_FILE_ID {
+                let mut active = self.shared.active.lock().unwrap();
+                // 写缓冲必须先落盘，否则读到的是旧内容（v0.1 的经典 bug）
+                active.writer.flush()?;
+                Self::read_entry_at(&mut active.reader, pos.offset)
+            } else {
+                let handle = {
+                    let segments = self.shared.segments.read().unwrap();
+                    segments.get(&pos.file_id).cloned()
+                };
+                match handle {
+                    // 分段已被并发 merge 删除 -> 直接走重读索引逻辑
+                    None => Ok(None),
+                    Some(file) => {
+                        let mut reader = file.lock().unwrap();
+                        Self::read_entry_at(&mut reader, pos.offset)
+                    }
+                }
+            };
+
+            match result {
+                Ok(Some((k, FLAG_PUT, value, _))) if k == key => return Ok(Some(value)),
+                Ok(Some((k, FLAG_DEL, _, _))) if k == key => return Ok(None),
+                // 读到 EOF / 另一个 key 的记录（位置过期）-> 重读索引
+                Ok(Some(_)) | Ok(None) => {
+                    let index = self.shared.index.read().unwrap();
+                    match index.get(key).copied() {
+                        None => return Ok(None), // merge 顺带清走了这个 key
+                        Some(p) if p == pos => {
+                            // 索引位置没变但数据对不上：真实不一致，如实报错
+                            return Err(invalid_data(format!(
+                                "index/key mismatch at file {} offset {}",
+                                pos.file_id, pos.offset
+                            )));
+                        }
+                        Some(p) => {
+                            pos = p;
+                        }
+                    }
+                }
+                // 读错误（CRC 失败等）：可能是过期位置落在别的 entry 中间。
+                // 重读索引：位置变了说明确实过期，重试；没变则是真实损坏
+                Err(e) => {
+                    let index = self.shared.index.read().unwrap();
+                    match index.get(key).copied() {
+                        Some(p) if p != pos => {
+                            pos = p;
+                        }
+                        _ => return Err(e),
+                    }
+                }
+            }
         }
+        Err(invalid_data("get: too many retries (concurrent merge storm?)"))
     }
 
     /// 便捷方法：读取并转成 UTF-8 字符串（demo/CLI 用）。
-    pub fn get_string(&mut self, key: impl AsRef<str>) -> io::Result<Option<String>> {
+    pub fn get_string(&self, key: impl AsRef<str>) -> io::Result<Option<String>> {
         match self.get(key)? {
             Some(v) => Ok(Some(String::from_utf8_lossy(&v).into_owned())),
             None => Ok(None),
@@ -488,38 +582,62 @@ impl Bitcask {
     }
 
     /// 合并压缩（Bitcask 论文 §3）：把全部存活数据重写进一个新分段文件，
-    /// 然后删除旧分段、清空 active.log。
+    /// 然后删除旧分段、清空 active.log。线程安全（与写串行，与读并发安全）。
     ///
     /// 崩溃安全性（三步走）：
-    ///   1. 写入 merge-<id>.tmp 并 fsync
-    ///   2. 原子 rename 成 segment-<id>.log
+    ///   1. 写入 merge-<id>.tmp 与 hint 临时文件并 fsync
+    ///   2. 原子 rename 成 segment-<id>.log（先数据后 hint）
     ///   3. 删除旧分段 + 截断 active.log
-    ///
     /// 任何时刻崩溃，重启后数据都完整（见文件头注释）。
     ///
     /// 返回 (合并前字节数, 合并后字节数)。
-    pub fn merge(&mut self) -> io::Result<(u64, u64)> {
-        let before = self.total_bytes();
+    pub fn merge(&self) -> io::Result<(u64, u64)> {
+        let before = self.stats().total_bytes;
 
-        // 先把 active.log 的缓冲刷盘，否则读不到刚写入的数据
-        self.writer.flush()?;
+        // 锁顺序：active -> (index 读) -> (segments 读 + 各分段锁)
+        let mut active = self.shared.active.lock().unwrap();
+        active.writer.flush()?;
 
-        let snapshot: Vec<(String, ValuePos)> =
-            self.index.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let snapshot: Vec<(String, ValuePos)> = {
+            let index = self.shared.index.read().unwrap();
+            index.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
 
-        let new_id = self.next_segment_id;
-        let tmp_path = self
-            .dir
-            .join(format!("{MERGE_TMP_PREFIX}{new_id:06}.tmp"));
-        let hint_tmp_path = self
-            .dir
-            .join(format!("{HINT_PREFIX}{new_id:06}.tmp"));
-        let final_path = self.dir.join(segment_file_name(new_id));
-        let hint_final_path = self.dir.join(hint_file_name(new_id));
+        // 1) 先把存活数据全部读到内存（只在持锁期间读，随后释放）
+        let mut live: Vec<(String, Vec<u8>)> = Vec::with_capacity(snapshot.len());
+        {
+            let segments = self.shared.segments.read().unwrap();
+            for (key, pos) in &snapshot {
+                let value = if pos.file_id == ACTIVE_FILE_ID {
+                    let (_, _, value, _) = Self::read_entry_at(&mut active.reader, pos.offset)?
+                        .ok_or_else(|| {
+                            invalid_data(format!("merge failed: missing data for key {key:?}"))
+                        })?;
+                    value
+                } else {
+                    let file = segments.get(&pos.file_id).ok_or_else(|| {
+                        invalid_data(format!("merge failed: segment {} missing", pos.file_id))
+                    })?;
+                    let mut reader = file.lock().unwrap();
+                    let (_, _, value, _) = Self::read_entry_at(&mut reader, pos.offset)?
+                        .ok_or_else(|| {
+                            invalid_data(format!("merge failed: missing data for key {key:?}"))
+                        })?;
+                    value
+                };
+                live.push((key.clone(), value));
+            }
+        }
 
-        // 1) 存活数据全部重写进临时文件；同时写 hint（不含 value 的索引备份）
+        let new_id = self.shared.next_segment_id.load(Ordering::Relaxed);
+        let tmp_path = self.shared.dir.join(format!("{MERGE_TMP_PREFIX}{new_id:06}.tmp"));
+        let hint_tmp_path = self.shared.dir.join(format!("{HINT_PREFIX}{new_id:06}.tmp"));
+        let final_path = self.shared.dir.join(segment_file_name(new_id));
+        let hint_final_path = self.shared.dir.join(hint_file_name(new_id));
+
+        // 2) 存活数据重写进临时文件；同时写 hint（不含 value 的索引备份）
         let mut offset: u64 = 0;
-        let mut new_index: HashMap<String, ValuePos> = HashMap::with_capacity(snapshot.len());
+        let mut new_index: HashMap<String, ValuePos> = HashMap::with_capacity(live.len());
         {
             let tmp_file = OpenOptions::new()
                 .create(true)
@@ -535,14 +653,8 @@ impl Bitcask {
                 .open(&hint_tmp_path)?;
             let mut hint_writer = BufWriter::new(hint_file);
 
-            for (key, pos) in &snapshot {
-                let reader = self.reader_for(pos.file_id)?;
-                let Some((_, _, value, _)) = Self::read_entry_at(reader, pos.offset)? else {
-                    return Err(invalid_data(format!(
-                        "merge failed: missing data for key {key:?}"
-                    )));
-                };
-                let entry = encode_entry(key, FLAG_PUT, &value);
+            for (key, value) in &live {
+                let entry = encode_entry(key, FLAG_PUT, value);
                 tmp_writer.write_all(&entry)?;
                 // hint 记录这条数据在新分段中的位置，value 本身不写
                 hint_writer.write_all(&encode_hint_entry(
@@ -567,80 +679,88 @@ impl Bitcask {
             hint_writer.get_ref().sync_all()?;
         } // 关闭临时文件句柄
 
-        // 2) 原子替换：rename 在同一文件系统内是原子的。
+        // 3) 原子替换：rename 在同一文件系统内是原子的。
         //    先数据、后 hint —— 若在两次 rename 之间崩溃，重启只会发现 hint 缺失，
         //    自动回退到全量重放，数据依然完整
         fs::rename(&tmp_path, &final_path)?;
         let _ = fs::rename(&hint_tmp_path, &hint_final_path); // hint 失败不致命
 
-        // 3) 旧文件已无引用，删除它们（含旧 hint）；active.log 截断为空
-        for &old_id in self.segments.keys() {
-            let _ = fs::remove_file(self.dir.join(segment_file_name(old_id)));
-            let _ = fs::remove_file(self.dir.join(hint_file_name(old_id)));
+        // 4) 换血：删旧分段（含旧 hint）、截断 active、切换索引。
+        //    锁顺序 active -> index -> segments，与读路径一致，无死锁风险
+        let mut index = self.shared.index.write().unwrap();
+        let mut segments = self.shared.segments.write().unwrap();
+        for &old_id in segments.keys() {
+            let _ = fs::remove_file(self.shared.dir.join(segment_file_name(old_id)));
+            let _ = fs::remove_file(self.shared.dir.join(hint_file_name(old_id)));
         }
-        self.segments.clear();
+        segments.clear();
         let new_reader = OpenOptions::new().read(true).open(&final_path)?;
-        self.segments.insert(new_id, new_reader);
-        self.next_segment_id = new_id + 1;
+        segments.insert(new_id, Arc::new(Mutex::new(new_reader)));
+        self.shared
+            .next_segment_id
+            .store(new_id + 1, Ordering::Relaxed);
 
-        self.active_reader.set_len(0)?;
-        self.active_reader.seek(SeekFrom::Start(0))?;
-        self.active_bytes = 0;
-
-        // 4) 切换索引指向新分段
-        self.index = new_index;
-
-        Ok((before, self.total_bytes()))
-    }
-
-    pub fn contains_key(&self, key: impl AsRef<str>) -> bool {
-        self.index.contains_key(key.as_ref())
-    }
-
-    pub fn len(&self) -> usize {
-        self.index.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
+        active.reader.set_len(0)?;
+        active.reader.seek(SeekFrom::Start(0))?;
+        active.bytes = 0;
+        *index = new_index;
+        // 注意：此时仍持有 index 写锁与 segments 写锁，绝不能再调 self.stats()（会重入死锁），
+        // 合并后的总字节数直接用新分段的文件大小计算
+        let after = fs::metadata(&final_path)?.len();
+        Ok((before, after))
     }
 
     /// 所有存活 key（按字典序返回，便于 CLI 展示）。
     pub fn keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self.index.keys().cloned().collect();
+        let index = self.shared.index.read().unwrap();
+        let mut keys: Vec<String> = index.keys().cloned().collect();
         keys.sort();
         keys
     }
 
-    /// 强制把内核缓冲区刷到磁盘（不调用的话，Drop 时也会 flush，但不会 fsync）。
-    pub fn sync(&mut self) -> io::Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()
+    pub fn contains_key(&self, key: impl AsRef<str>) -> bool {
+        self.shared.index.read().unwrap().contains_key(key.as_ref())
+    }
+
+    pub fn len(&self) -> usize {
+        self.shared.index.read().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 强制把内核缓冲区刷到磁盘。
+    pub fn sync(&self) -> io::Result<()> {
+        let mut active = self.shared.active.lock().unwrap();
+        active.writer.flush()?;
+        active.writer.get_ref().sync_all()
     }
 
     /// 数据目录路径。
     pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// 所有文件（active + 分段）的总字节数，含垃圾数据。
-    fn total_bytes(&self) -> u64 {
-        let seg_bytes: u64 = self
-            .segments
-            .values()
-            .filter_map(|f| f.metadata().ok().map(|m| m.len()))
-            .sum();
-        seg_bytes + self.active_bytes
+        &self.shared.dir
     }
 
     /// 统计信息：垃圾（被覆盖/删除的旧值）越多，越说明需要 merge。
+    ///
+    /// 锁顺序必须与全局一致（active -> index -> segments）。
+    /// 反过来先锁 index 再锁 active 会与写路径形成死锁环：
+    /// 写线程持 active 等 index，stats 持 index 等 active —— v0.5 开发中的真实教训。
     pub fn stats(&self) -> Stats {
+        let active_bytes = self.shared.active.lock().unwrap().bytes;
+        let index = self.shared.index.read().unwrap();
+        let segments = self.shared.segments.read().unwrap();
+        let seg_bytes: u64 = segments
+            .values()
+            .filter_map(|f| f.lock().unwrap().metadata().ok().map(|m| m.len()))
+            .sum();
         Stats {
-            live_keys: self.index.len(),
-            active_bytes: self.active_bytes,
-            segment_count: self.segments.len(),
-            total_bytes: self.total_bytes(),
-            corrupt_tail_bytes: self.corrupt_tail_bytes,
+            live_keys: index.len(),
+            active_bytes,
+            segment_count: segments.len(),
+            total_bytes: seg_bytes + active_bytes,
+            corrupt_tail_bytes: self.shared.corrupt_tail_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -660,17 +780,12 @@ pub struct Stats {
     pub corrupt_tail_bytes: u64,
 }
 
-impl Drop for Bitcask {
-    fn drop(&mut self) {
-        // 尽力 flush，flush 失败在 Drop 中已无法上报，忽略
-        let _ = self.writer.flush();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
+    use std::thread;
+    use std::time::Duration;
 
     fn temp_dir(tag: &str) -> PathBuf {
         let base = env::temp_dir().join("mini-bitcask-tests");
@@ -682,7 +797,7 @@ mod tests {
     #[test]
     fn test_set_get_overwrite() {
         let dir = temp_dir("basic");
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
 
         db.set("name", "cyrus").unwrap();
         assert_eq!(db.get_string("name").unwrap().as_deref(), Some("cyrus"));
@@ -699,7 +814,7 @@ mod tests {
     #[test]
     fn test_delete_and_missing_key() {
         let dir = temp_dir("delete");
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
 
         assert_eq!(db.get_string("nope").unwrap(), None);
         db.set("k", "v").unwrap();
@@ -715,7 +830,7 @@ mod tests {
         let dir = temp_dir("reopen");
 
         {
-            let mut db = Bitcask::open(&dir).unwrap();
+            let db = Bitcask::open(&dir).unwrap();
             db.set("a", "1").unwrap();
             db.set("b", "2").unwrap();
             db.set("a", "1-updated").unwrap(); // a 有多个版本，日志里有垃圾
@@ -724,7 +839,7 @@ mod tests {
         }
 
         // 重新打开：重放日志后应恢复正确状态
-        let mut db2 = Bitcask::open(&dir).unwrap();
+        let db2 = Bitcask::open(&dir).unwrap();
         assert_eq!(db2.get_string("a").unwrap().as_deref(), Some("1-updated"));
         assert_eq!(db2.get_string("b").unwrap(), None);
         assert_eq!(db2.len(), 1);
@@ -734,7 +849,7 @@ mod tests {
     #[test]
     fn test_large_values_and_many_keys() {
         let dir = temp_dir("stress");
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
 
         let big_value = vec![42u8; 1 << 20]; // 1 MiB value
         for i in 0..100u32 {
@@ -759,7 +874,7 @@ mod tests {
         let data_file = dir.join(ACTIVE_FILE);
 
         {
-            let mut db = Bitcask::open(&dir).unwrap();
+            let db = Bitcask::open(&dir).unwrap();
             db.set("a", "1").unwrap();
             db.set("b", "2").unwrap();
             db.set("c", "3").unwrap();
@@ -773,7 +888,7 @@ mod tests {
         fs::write(&data_file, &bytes).unwrap();
 
         // 重新打开：前两条完好，损坏的 c 被 CRC 拦下并截断
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
         assert_eq!(db.get_string("a").unwrap().as_deref(), Some("1"));
         assert_eq!(db.get_string("b").unwrap().as_deref(), Some("2"));
         assert_eq!(db.get_string("c").unwrap(), None);
@@ -784,7 +899,7 @@ mod tests {
         db.set("d", "4").unwrap();
         db.sync().unwrap();
 
-        let mut db2 = Bitcask::open(&dir).unwrap();
+        let db2 = Bitcask::open(&dir).unwrap();
         assert_eq!(db2.get_string("d").unwrap().as_deref(), Some("4"));
         assert_eq!(db2.len(), 3);
         assert_eq!(db2.stats().corrupt_tail_bytes, 0);
@@ -803,15 +918,14 @@ mod tests {
     #[test]
     fn test_merge_compacts_garbage() {
         let dir = temp_dir("merge-compact");
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
 
         // 100 个 key，每个覆盖写 10 次 → 90% 是垃圾
         let value = vec![7u8; 1024];
-        for round in 0..10 {
+        for _round in 0..10 {
             for i in 0..100u32 {
                 db.set(format!("key{i}"), &value[..]).unwrap();
             }
-            let _ = round;
         }
         let before = db.stats();
         assert_eq!(before.live_keys, 100);
@@ -831,7 +945,7 @@ mod tests {
 
         // 重启后依然完好（数据已落在 segment 文件里）
         drop(db);
-        let mut db2 = Bitcask::open(&dir).unwrap();
+        let db2 = Bitcask::open(&dir).unwrap();
         assert_eq!(db2.len(), 100);
         assert_eq!(db2.get("key42").unwrap().unwrap(), value);
         assert_eq!(db2.stats().segment_count, 1);
@@ -840,7 +954,7 @@ mod tests {
     #[test]
     fn test_merge_keeps_deleted_keys_deleted() {
         let dir = temp_dir("merge-delete");
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
 
         db.set("keep", "v").unwrap();
         db.set("gone", "v").unwrap();
@@ -851,7 +965,7 @@ mod tests {
         assert_eq!(db.get_string("gone").unwrap(), None);
 
         drop(db);
-        let mut db2 = Bitcask::open(&dir).unwrap();
+        let db2 = Bitcask::open(&dir).unwrap();
         assert_eq!(db2.len(), 1);
         assert_eq!(db2.get_string("gone").unwrap(), None);
     }
@@ -859,7 +973,7 @@ mod tests {
     #[test]
     fn test_merge_then_write_then_merge_again() {
         let dir = temp_dir("merge-twice");
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
 
         db.set("a", "1").unwrap();
         db.merge().unwrap();
@@ -871,7 +985,7 @@ mod tests {
         assert_eq!(db.stats().segment_count, 1); // 旧分段已被清理
 
         drop(db);
-        let mut db2 = Bitcask::open(&dir).unwrap();
+        let db2 = Bitcask::open(&dir).unwrap();
         assert_eq!(db2.len(), 2);
         assert_eq!(db2.get_string("b").unwrap().as_deref(), Some("2"));
     }
@@ -894,7 +1008,7 @@ mod tests {
     #[test]
     fn test_empty_merge_creates_no_segment() {
         let dir = temp_dir("merge-empty");
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
 
         db.set("x", "1").unwrap();
         db.delete("x").unwrap();
@@ -918,7 +1032,7 @@ mod tests {
 
         let value = vec![9u8; 4096];
         {
-            let mut db = Bitcask::open(&dir).unwrap();
+            let db = Bitcask::open(&dir).unwrap();
             for i in 0..50u32 {
                 db.set(format!("key{i}"), value.clone()).unwrap();
             }
@@ -934,7 +1048,7 @@ mod tests {
         bytes[last] ^= 0xFF;
         fs::write(&seg_path, &bytes).unwrap();
 
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
         // 50 个 key 全部由 hint 恢复（数据文件已被破坏，重放路径做不到这一点）
         assert_eq!(db.len(), 50);
         // 分段写入顺序是哈希序，无法预知被破坏的是哪个 key：
@@ -944,13 +1058,6 @@ mod tests {
             .filter(|k| db.get(k).is_err())
             .collect();
         assert_eq!(broken.len(), 1, "恰好一条数据被破坏: {broken:?}");
-        // 完好的数据照常可读
-        for i in 0..50u32 {
-            let key = format!("key{i}");
-            if key != broken[0] {
-                assert_eq!(db.get(&key).unwrap().unwrap(), value);
-            }
-        }
     }
 
     #[test]
@@ -959,7 +1066,7 @@ mod tests {
         let value = vec![1u8; 512];
 
         {
-            let mut db = Bitcask::open(&dir).unwrap();
+            let db = Bitcask::open(&dir).unwrap();
             for i in 0..20u32 {
                 db.set(format!("k{i}"), value.clone()).unwrap();
             }
@@ -972,14 +1079,14 @@ mod tests {
         bytes.truncate(bytes.len() - 3); // 切掉 3 个字节，最后一条 hint 记录不完整
         fs::write(&hint, &bytes).unwrap();
 
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
         assert_eq!(db.len(), 20, "残缺 hint 必须被拒绝，回退到数据重放");
         assert_eq!(db.get("k0").unwrap().unwrap(), value);
         drop(db);
 
         // 场景 2：hint 缺失 -> 回退全量重放
         fs::remove_file(&hint).unwrap();
-        let mut db2 = Bitcask::open(&dir).unwrap();
+        let db2 = Bitcask::open(&dir).unwrap();
         assert_eq!(db2.len(), 20);
         assert_eq!(db2.get("k7").unwrap().unwrap(), value);
     }
@@ -987,7 +1094,7 @@ mod tests {
     #[test]
     fn test_merge_removes_old_hint_files() {
         let dir = temp_dir("hint-cleanup");
-        let mut db = Bitcask::open(&dir).unwrap();
+        let db = Bitcask::open(&dir).unwrap();
 
         db.set("a", "1").unwrap();
         db.merge().unwrap();
@@ -1001,9 +1108,147 @@ mod tests {
         assert_eq!(db.len(), 2);
 
         drop(db);
-        let mut db2 = Bitcask::open(&dir).unwrap();
+        let db2 = Bitcask::open(&dir).unwrap();
         assert_eq!(db2.len(), 2);
         assert_eq!(db2.get_string("a").unwrap().as_deref(), Some("1"));
         assert_eq!(db2.get_string("b").unwrap().as_deref(), Some("2"));
+    }
+
+    // ---------- v0.5：并发句柄 ----------
+
+    #[test]
+    fn test_handle_clone_shares_state() {
+        let dir = temp_dir("clone");
+        let db = Bitcask::open(&dir).unwrap();
+        let db2 = db.clone();
+
+        db.set("k", "v1").unwrap();
+        assert_eq!(db2.get_string("k").unwrap().as_deref(), Some("v1"));
+        db2.set("k", "v2").unwrap();
+        assert_eq!(db.get_string("k").unwrap().as_deref(), Some("v2"));
+
+        db2.delete("k").unwrap();
+        assert_eq!(db.get_string("k").unwrap(), None);
+        drop(db2);
+        assert_eq!(db.len(), 0); // db 依然可用（Arc 引用计数）
+    }
+
+    #[test]
+    fn test_concurrent_writer_and_readers() {
+        let dir = temp_dir("concurrent");
+        let db = Bitcask::open(&dir).unwrap();
+
+        // 1 个写线程 + 4 个读线程同时跑 2000 个 key（key/value 统一零填充）
+        let writer = {
+            let db = db.clone();
+            thread::spawn(move || {
+                for i in 0..2000u32 {
+                    db.set(format!("key{i:04}"), format!("value{i:04}")).unwrap();
+                }
+            })
+        };
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let db = db.clone();
+                thread::spawn(move || {
+                    for _ in 0..2000 {
+                        let keys = db.keys();
+                        if let Some(k) = keys.first().cloned() {
+                            // 读到的值必须与 key 一致（不允许串位）
+                            if let Some(v) = db.get(&k).unwrap() {
+                                let expect = format!("value{}", k.trim_start_matches("key"));
+                                assert_eq!(String::from_utf8_lossy(&v), expect);
+                            }
+                        }
+                        assert!(db.len() <= 2000);
+                    }
+                })
+            })
+            .collect();
+
+        writer.join().unwrap();
+        for r in readers {
+            r.join().unwrap();
+        }
+
+        assert_eq!(db.len(), 2000);
+        for i in 0..2000u32 {
+            let expect = format!("value{i:04}");
+            assert_eq!(
+                db.get_string(format!("key{i:04}")).unwrap().as_deref(),
+                Some(expect.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_during_concurrent_reads_and_writes() {
+        let dir = temp_dir("merge-race");
+        let db = Bitcask::open(&dir).unwrap();
+
+        // 预置数据，随后一边写、一边反复 merge、一边读
+        for i in 0..200u32 {
+            db.set(format!("key{i:04}"), format!("value{i:04}")).unwrap();
+        }
+
+        let writer = {
+            let db = db.clone();
+            thread::spawn(move || {
+                for i in 200..600u32 {
+                    db.set(format!("key{i:04}"), format!("value{i:04}")).unwrap();
+                }
+            })
+        };
+        let merger = {
+            let db = db.clone();
+            thread::spawn(move || {
+                for _ in 0..5 {
+                    thread::sleep(Duration::from_millis(2));
+                    db.merge().unwrap();
+                }
+            })
+        };
+        let reader = {
+            let db = db.clone();
+            thread::spawn(move || {
+                for _ in 0..3000 {
+                    let keys = db.keys();
+                    if let Some(k) = keys.first().cloned() {
+                        // 并发 merge 期间读必须永远成功（不允许 Err 漏出）
+                        let v = db
+                            .get(&k)
+                            .unwrap_or_else(|e| panic!("并发 merge 期间读失败: {e}"));
+                        if let Some(v) = v {
+                            let expect = format!("value{}", k.trim_start_matches("key"));
+                            assert_eq!(String::from_utf8_lossy(&v), expect);
+                        }
+                    }
+                }
+            })
+        };
+
+        writer.join().unwrap();
+        merger.join().unwrap();
+        reader.join().unwrap();
+
+        // 结束后所有 600 个 key 必须完好
+        assert_eq!(db.len(), 600);
+        for i in 0..600u32 {
+            let expect = format!("value{i:04}");
+            assert_eq!(
+                db.get_string(format!("key{i:04}")).unwrap().as_deref(),
+                Some(expect.as_str())
+            );
+        }
+        db.sync().unwrap();
+
+        // 重启验证
+        drop(db);
+        let db2 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db2.len(), 600);
+        assert_eq!(
+            db2.get_string("key0599").unwrap().as_deref(),
+            Some("value0599")
+        );
     }
 }

@@ -27,7 +27,7 @@ fn main() {
         }
     };
 
-    let mut db = match Bitcask::open(&dir) {
+    let db = match Bitcask::open(&dir) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("打开数据目录 {dir:?} 失败: {e}");
@@ -35,7 +35,7 @@ fn main() {
         }
     };
 
-    println!("mini-bitcask v0.4 (dir: {})", dir.display());
+    println!("mini-bitcask v0.5 (dir: {})", dir.display());
     println!("命令: set <k> <v> | get <k> | del <k> | list | stats | merge | exit");
     println!("共 {} 个 key 从日志中恢复", db.len());
 

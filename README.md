@@ -108,7 +108,10 @@ merge 不是"原地覆写"，而是经典的三步走：
       重启时若 hint 结构完整则直接建索引，完全跳过数据扫描；
       任一校验失败（残缺/越界）则整体作废，回退全量重放 —— 宁可不加速也不能读错。
       实测教训：残缺 hint 必须回退而不是报错 —— 容错是 hint 信任策略的一部分
-- [ ] **v0.5 并发句柄**：`Arc<RwLock<Bitcask>>` 或多 reader 单 writer（Bitcask 原文的设计）
+- [x] **v0.5 并发句柄**：`Bitcask` 变成 `Clone + Send + Sync` 共享句柄（内部 `Arc`），多读单写。
+      锁顺序全局统一（active → index → segments）；get 校验读出的 key 并在位置过期时重试。
+      实测教训 ×2：① `stats()` 反序锁（先 index 后 active）会与写路径形成死锁环；
+      ② 并发 merge 下索引位置会过期，读出的 entry 必须校验 key，否则会把别的 key 的值读给调用方
 - [ ] **v0.6 索引优化**：keydir 换成 `BTreeMap` 支持范围查询 / 尝试内嵌布隆过滤器
 - [ ] **v0.7 基准测试**：用 `criterion` 跑 set/get 压测，对比纯 HashMap 基线
 

@@ -1,6 +1,6 @@
 [package]
 name = "mini-bitcask"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "A tiny Bitcask-style KV storage engine in pure Rust (learning project)"
 license = "MIT"
