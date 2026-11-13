@@ -10,6 +10,8 @@
 //!   list                列出所有 key
 //!   stats               查看统计（key 数 / 总字节数 / 分段数）
 //!   merge               合并压缩（把存活数据重写进新分段，删除垃圾）
+//!   range <a> <b>       范围扫描 [a, b)，按 key 升序
+//!   prefix <p>          前缀扫描（如 prefix user:）
 //!   exit                退出（自动 flush）
 
 use mini_bitcask::Bitcask;
@@ -35,8 +37,9 @@ fn main() {
         }
     };
 
-    println!("mini-bitcask v0.5 (dir: {})", dir.display());
-    println!("命令: set <k> <v> | get <k> | del <k> | list | stats | merge | exit");
+    println!("mini-bitcask v0.6 (dir: {})", dir.display());
+    println!("命令: set <k> <v> | get <k> | del <k> | list | stats");
+    println!("      merge | range <a> <b> | prefix <p> | exit");
     println!("共 {} 个 key 从日志中恢复", db.len());
 
     let stdin = io::stdin();
@@ -100,6 +103,12 @@ fn main() {
                 };
                 format!("merge 完成: {before} B -> {after} B (压缩到 {ratio:.1}%)")
             }),
+            ("range", start, end) if !start.is_empty() && !end.is_empty() => {
+                db.range(start, end).map(|rows| format_rows(&rows))
+            }
+            ("prefix", p, _) if !p.is_empty() => {
+                db.scan_prefix(p).map(|rows| format_rows(&rows))
+            }
             ("exit", "", _) | ("quit", "", _) => {
                 let _ = db.sync();
                 println!("bye");
@@ -107,7 +116,7 @@ fn main() {
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "未知命令，支持: set <k> <v> / get <k> / del <k> / list / stats / merge / exit",
+                "未知命令，支持: set/get/del/list/stats/merge/range <a> <b>/prefix <p>/exit",
             )),
         };
 
@@ -116,4 +125,15 @@ fn main() {
             Err(e) => println!("错误: {e}"),
         }
     }
+}
+
+/// 把范围查询结果格式化成 "key = value" 多行文本。
+fn format_rows(rows: &[(String, Vec<u8>)]) -> String {
+    if rows.is_empty() {
+        return "(empty)".to_string();
+    }
+    rows.iter()
+        .map(|(k, v)| format!("{k} = {}", String::from_utf8_lossy(v)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

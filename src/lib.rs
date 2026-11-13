@@ -1,9 +1,9 @@
-//! mini-bitcask —— 一个 ~800 行的 Bitcask 风格 KV 存储引擎（教学/开源项目）
+//! mini-bitcask —— 一个 ~820 行的 Bitcask 风格 KV 存储引擎（教学/开源项目）
 //!
 //! 设计模型（来自 Basho/riak 的 Bitcask 论文）：
 //!
 //!   写路径：所有写操作（set/delete）以 append-only 方式追加到 active.log
-//!   索引：  内存中维护 HashMap<key, (file_id, offset)>，指向该 key 最新值的磁盘位置
+//!   索引：  内存中维护有序索引 BTreeMap<key, (file_id, offset)>，指向最新值的磁盘位置
 //!   读路径：查内存索引 -> 按 (file, offset) 直接 seek 读取 value
 //!   启动：  重放全部分段 + active.log，重建内存索引
 //!   合并：  merge 把存活数据重写进新分段文件，随后删除旧文件（见 merge()）
@@ -44,10 +44,17 @@
 //!   2. merge 用 "写临时文件 -> fsync -> 原子 rename" 三步，任何时刻崩溃都不会丢数据；
 //!      rename 顺序先数据后 hint，中间崩溃只损失加速路径
 //!
-//! 这是刻意留白的项目：索引优化（BTreeMap/布隆过滤器）、基准测试等
+//! v0.6 索引优化：keydir 从 HashMap 换成 BTreeMap（`KeyDir` 别名）。
+//!
+//!   - 单点读写从 O(1) 变成 O(log n)（可接受的代价）
+//!   - 换来：key 天然有序（keys/range/prefix 无需排序）、范围查询 [a, b)、前缀扫描
+//!   - range()/scan_prefix() 先在索引读锁内收集 key 列表（短持锁），
+//!     再逐个 get 取 value —— 不阻塞写入，并自动继承 get 的并发 merge 重试逻辑
+//!
+//! 这是刻意留白的项目：布隆过滤器、基准测试等
 //! 留作后续演进路线，见 README.md 的 Roadmap。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -70,6 +77,9 @@ const ACTIVE_FILE_ID: u64 = 0;
 
 /// 一条 entry 的解析结果：(key, flag, value, entry 总字节数)
 type Entry = (String, u8, Vec<u8>, u64);
+
+/// 内存索引（keydir）：key 有序存储，支持范围查询与前缀扫描。
+type KeyDir = BTreeMap<String, ValuePos>;
 
 /// 一次写入在磁盘上的位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +199,7 @@ fn load_index_from_hint(
     hint_path: &Path,
     file_id: u64,
     seg_len: u64,
-    index: &mut HashMap<String, ValuePos>,
+    index: &mut KeyDir,
 ) -> io::Result<bool> {
     let file = match File::open(hint_path) {
         Ok(f) => f,
@@ -263,7 +273,7 @@ struct ActiveFile {
 struct Shared {
     dir: PathBuf,
     /// 内存索引：key -> 最新值的位置
-    index: RwLock<HashMap<String, ValuePos>>,
+    index: RwLock<KeyDir>,
     /// 只读分段文件的读句柄（id -> 句柄）。读用读锁，merge 换血用写锁
     segments: RwLock<HashMap<u64, Arc<Mutex<File>>>>,
     /// active.log 读写句柄（所有写入串行化的单点）
@@ -332,7 +342,7 @@ impl Bitcask {
             .collect();
         segment_ids.sort_unstable();
 
-        let mut index: HashMap<String, ValuePos> = HashMap::new();
+        let mut index = KeyDir::new();
         let mut segments: HashMap<u64, Arc<Mutex<File>>> = HashMap::new();
         for &id in &segment_ids {
             let seg_path = dir.join(segment_file_name(id));
@@ -398,7 +408,7 @@ impl Bitcask {
     fn replay_file(
         file: &mut File,
         file_id: u64,
-        index: &mut HashMap<String, ValuePos>,
+        index: &mut KeyDir,
     ) -> io::Result<(u64, u64)> {
         let mut offset: u64 = 0;
         loop {
@@ -638,7 +648,7 @@ impl Bitcask {
 
         // 2) 存活数据重写进临时文件；同时写 hint（不含 value 的索引备份）
         let mut offset: u64 = 0;
-        let mut new_index: HashMap<String, ValuePos> = HashMap::with_capacity(live.len());
+        let mut new_index = KeyDir::new();
         {
             let tmp_file = OpenOptions::new()
                 .create(true)
@@ -711,12 +721,52 @@ impl Bitcask {
         Ok((before, after))
     }
 
-    /// 所有存活 key（按字典序返回，便于 CLI 展示）。
+    /// 所有存活 key（BTreeMap 天然有序，无需额外排序）。
     pub fn keys(&self) -> Vec<String> {
         let index = self.shared.index.read().unwrap();
-        let mut keys: Vec<String> = index.keys().cloned().collect();
-        keys.sort();
-        keys
+        index.keys().cloned().collect()
+    }
+
+    /// 范围扫描 `[start, end)`：按 key 升序返回键值对（左闭右开，与 BTreeMap::range 一致）。
+    ///
+    /// 实现取舍：先在索引读锁内收集 key 列表（短持锁），再逐个走 get 取 value。
+    /// 这样不会被慢读阻塞写入，也自动继承 get 的并发 merge 重试逻辑；
+    /// 代价是每条数据多一次索引查找（O(k log n)），
+    /// 未来可用 "持锁读全部 value" 换取一次遍历（O(k) 但锁持有时间长）。
+    pub fn range(&self, start: &str, end: &str) -> io::Result<Vec<(String, Vec<u8>)>> {
+        let keys: Vec<String> = {
+            let index = self.shared.index.read().unwrap();
+            index
+                .range(start.to_owned()..end.to_owned())
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        self.collect_values(&keys)
+    }
+
+    /// 前缀扫描：返回所有以 `prefix` 开头的键值对（升序）。
+    /// 常见用途：按命名空间枚举，如 `user:` 前缀下的全部用户。
+    pub fn scan_prefix(&self, prefix: &str) -> io::Result<Vec<(String, Vec<u8>)>> {
+        let keys: Vec<String> = {
+            let index = self.shared.index.read().unwrap();
+            index
+                .range(prefix.to_owned()..)
+                .take_while(|(k, _)| k.starts_with(prefix))
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+        self.collect_values(&keys)
+    }
+
+    /// 批量取 value：并发 merge 期间某条 key 可能刚好被清走，跳过即可。
+    fn collect_values(&self, keys: &[String]) -> io::Result<Vec<(String, Vec<u8>)>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.get(key)? {
+                out.push((key.clone(), value));
+            }
+        }
+        Ok(out)
     }
 
     pub fn contains_key(&self, key: impl AsRef<str>) -> bool {
@@ -1116,6 +1166,84 @@ mod tests {
     }
 
     // ---------- v0.5：并发句柄 ----------
+
+    // ---------- v0.6：BTreeMap 有序索引 ----------
+
+    #[test]
+    fn test_range_query_sorted_and_half_open() {
+        let dir = temp_dir("range");
+        let db = Bitcask::open(&dir).unwrap();
+
+        for k in ["a", "b", "c", "d", "e"] {
+            db.set(k, format!("v-{k}")).unwrap();
+        }
+
+        // 左闭右开：包含 b/c/d，不含 a/e
+        let rows = db.range("b", "e").unwrap();
+        let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["b", "c", "d"]);
+        assert_eq!(rows[0].1, b"v-b".to_vec());
+
+        // 空结果与边界
+        assert!(db.range("x", "z").unwrap().is_empty());
+        assert_eq!(db.range("", "a").unwrap().len(), 0); // [.., "a") 不含 a
+
+        // 删除后范围查询即时反映
+        db.delete("c").unwrap();
+        let keys: Vec<String> = db.range("b", "e").unwrap().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, vec!["b".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn test_scan_prefix() {
+        let dir = temp_dir("prefix");
+        let db = Bitcask::open(&dir).unwrap();
+
+        db.set("user:1", "alice").unwrap();
+        db.set("user:2", "bob").unwrap();
+        db.set("user:10", "carol").unwrap();
+        db.set("order:1", "o1").unwrap();
+        db.set("usr:1", "typo").unwrap();
+
+        let rows = db.scan_prefix("user:").unwrap();
+        let keys: Vec<String> = rows.iter().map(|(k, _)| k.clone()).collect();
+        // BTreeMap 字典序："user:10" 排在 "user:2" 之前（字符串序，不是数值序）
+        assert_eq!(keys, vec!["user:1", "user:10", "user:2"]);
+
+        assert_eq!(db.scan_prefix("nope:").unwrap().len(), 0);
+        assert_eq!(db.scan_prefix("").unwrap().len(), 5); // 空前缀 = 全部
+    }
+
+    #[test]
+    fn test_range_survives_reopen_and_merge() {
+        let dir = temp_dir("range-reopen");
+
+        {
+            let db = Bitcask::open(&dir).unwrap();
+            for i in 0..20u32 {
+                db.set(format!("key{i:02}"), format!("v{i}")).unwrap();
+            }
+            db.merge().unwrap();
+            db.sync().unwrap();
+        }
+
+        // 重启（hint 或重放）+ 索引仍有序
+        let db = Bitcask::open(&dir).unwrap();
+        let keys: Vec<String> = db
+            .range("key05", "key09")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["key05", "key06", "key07", "key08"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(db.keys().len(), 20);
+    }
 
     #[test]
     fn test_handle_clone_shares_state() {

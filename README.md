@@ -39,8 +39,27 @@ mydata/
 └── merge-000002.tmp      merge 中的临时文件，rename 后成为正式分段
 ```
 
-内存索引保存 `key -> (file_id, offset)`，读操作按位置直接 seek，一次 IO 拿到 value。
+内存索引保存 `key -> (file_id, offset)`（BTreeMap，有序），读操作按位置直接 seek，一次 IO 拿到 value。
 重启时：有完好的 hint 就直接用它建索引（不碰数据文件）；否则重放数据。
+
+## 范围查询与前缀扫描
+
+```rust
+// [start, end) 左闭右开，结果按 key 升序
+for (k, v) in db.range("user:1", "user:99")? { /* ... */ }
+
+// 前缀扫描：常用于按命名空间枚举
+let users = db.scan_prefix("user:")?;
+```
+
+```
+> prefix user:
+user:1 = alice
+user:10 = carol
+user:2 = bob
+```
+
+注意：字符串字典序下 `user:10` 排在 `user:2` 之前——想要数值序请用零填充 key。
 
 ## 快速开始
 
@@ -112,8 +131,12 @@ merge 不是"原地覆写"，而是经典的三步走：
       锁顺序全局统一（active → index → segments）；get 校验读出的 key 并在位置过期时重试。
       实测教训 ×2：① `stats()` 反序锁（先 index 后 active）会与写路径形成死锁环；
       ② 并发 merge 下索引位置会过期，读出的 entry 必须校验 key，否则会把别的 key 的值读给调用方
-- [ ] **v0.6 索引优化**：keydir 换成 `BTreeMap` 支持范围查询 / 尝试内嵌布隆过滤器
-- [ ] **v0.7 基准测试**：用 `criterion` 跑 set/get 压测，对比纯 HashMap 基线
+- [x] **v0.6 有序索引**：keydir 从 `HashMap` 换成 `BTreeMap`。
+      单点读写 O(log n) 的代价，换来 key 天然有序、范围查询 `[a, b)`、前缀扫描；
+      `range`/`scan_prefix` 先在索引读锁内收集 key（短持锁）再逐个取值，
+      不阻塞写入且自动继承并发 merge 的重试逻辑
+- [ ] **v0.7 布隆过滤器**：每分段内嵌 bloom filter，未命中的 key 直接跳过磁盘读
+- [ ] **v0.8 基准测试**：用 `criterion` 跑 set/get/range 压测，对比纯 BTreeMap 基线
 
 ## 相关阅读
 
