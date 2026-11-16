@@ -74,6 +74,17 @@
 //!     破坏「多读单写」模型（读线程要抢 active 锁、读放大成写放大）。
 //!     代价是空间回收延迟，用一次 merge 换回来，这个交易值得
 //!
+//! v1.0 批量写：`write_batch(Vec<Op>)` / `set_many(iter)` 把一批操作编码进
+//!   一个连续缓冲区，只做一次 `write_all`、只取一次 active 锁、只取一次 index 锁。
+//!
+//!   实测结论（见 README 的性能归因）：批量写只快 1.2–1.4x，而不是想象中的数倍。
+//!   原因是我们先假设"锁 + 系统调用是大头"，量出来却发现 CRC-32 单项就占单条 set 的 36–41%，
+//!   而它是逐字节的纯 CPU 工作，批量摊薄不了。教训：**先测量，再优化** ——
+//!   这个仓库里最值钱的东西不是引擎，而是"假设被数据推翻"的过程。
+//!
+//!   边界：这批操作在磁盘上是 N 条独立记录，**不保证原子性**；
+//!   写到一半崩溃是"前缀可见"，不是"全有或全无"。要原子性得加 commit record，那是另一回事。
+//!
 //! 这是刻意留白的项目：基准测试留作后续演进路线，见 README.md 的 Roadmap。
 
 use std::collections::{BTreeMap, HashMap};
@@ -134,6 +145,62 @@ struct ValuePos {
     expire_at: u64,
 }
 
+/// 一批写入的字节上限：防止调用方一次塞进海量数据把内存吃光。
+/// 超限直接报错而不是静默分批 —— 静默分批会让"一次批量写"的语义悄悄变味。
+const MAX_BATCH_BYTES: usize = 64 << 20; // 64 MiB
+
+/// 批量写中的一个操作。
+///
+/// 用枚举而不是两个独立方法，是为了让「一批里既有写又有删」也能一次落盘 ——
+/// 真实场景里删除往往和更新成对出现（比如迁移用户数据）。
+#[derive(Debug, Clone)]
+pub enum Op {
+    /// 写入（ttl = None 表示永不过期）
+    Put {
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<std::time::Duration>,
+    },
+    /// 删除（追加墓碑）
+    Delete { key: String },
+}
+
+impl Op {
+    pub fn put(key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
+        Op::Put {
+            key: key.into(),
+            value: value.into(),
+            ttl: None,
+        }
+    }
+
+    pub fn put_with_ttl(
+        key: impl Into<String>,
+        value: impl Into<Vec<u8>>,
+        ttl: std::time::Duration,
+    ) -> Self {
+        Op::Put {
+            key: key.into(),
+            value: value.into(),
+            ttl: Some(ttl),
+        }
+    }
+
+    pub fn delete(key: impl Into<String>) -> Self {
+        Op::Delete { key: key.into() }
+    }
+
+    /// 把 ttl 折算成绝对过期时间戳（0 = 永不过期）
+    fn expire_at(&self) -> u64 {
+        match self {
+            Op::Put { ttl: Some(ttl), .. } if !ttl.is_zero() => {
+                now_ms().saturating_add(ttl.as_millis() as u64)
+            }
+            _ => 0,
+        }
+    }
+}
+
 /// 当前时间（unix 毫秒）。系统时钟回拨时返回 0（等价于"不过期"，绝不误删）。
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -150,8 +217,11 @@ fn is_expired(expire_at: u64) -> bool {
 // ---------------- 编码与 CRC ----------------
 
 /// CRC-32（IEEE 802.3，多项式 0xEDB88320），查表法。
+///
 /// 故意手写而非引入 crc crate —— 本项目坚持零依赖，顺便看清校验和的本质。
-fn crc32(data: &[u8]) -> u32 {
+/// 公开为 API：外部可用它校验本引擎写出的记录，也让基准能直接测量它的成本。
+/// （它是逐字节的纯 CPU 工作，**无法**靠批量写摊薄 —— 见 README 的性能归因。）
+pub fn crc32(data: &[u8]) -> u32 {
     static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
     let table = TABLE.get_or_init(|| {
         let mut t = [0u32; 256];
@@ -179,19 +249,29 @@ fn invalid_data(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+/// 把一条记录追加编码到已有缓冲区（批量写用）。
+///
+/// 与 `encode_entry` 的区别：不产生临时 Vec，直接写进目标缓冲区，
+/// 省掉每条记录一次堆分配 + 一次拷贝。CRC 用"先占位、回填"的方式计算 ——
+/// 因为 CRC 覆盖的 payload 必须完整存在于缓冲区里才能算。
+fn encode_entry_into(buf: &mut Vec<u8>, key: &str, flag: u8, value: &[u8], expire_at: u64) {
+    let crc_slot = buf.len();
+    buf.extend_from_slice(&[0u8; 4]); // CRC 占位
+    let payload_start = buf.len();
+    buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    buf.push(flag);
+    buf.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&expire_at.to_be_bytes());
+    buf.extend_from_slice(key.as_bytes());
+    buf.extend_from_slice(value);
+    let crc = crc32(&buf[payload_start..]);
+    buf[crc_slot..crc_slot + 4].copy_from_slice(&crc.to_be_bytes());
+}
+
 /// 把一条记录编码成完整的磁盘字节流（crc + payload）。
 fn encode_entry(key: &str, flag: u8, value: &[u8], expire_at: u64) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(17 + key.len() + value.len());
-    payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
-    payload.push(flag);
-    payload.extend_from_slice(&(value.len() as u32).to_be_bytes());
-    payload.extend_from_slice(&expire_at.to_be_bytes());
-    payload.extend_from_slice(key.as_bytes());
-    payload.extend_from_slice(value);
-
-    let mut out = Vec::with_capacity(4 + payload.len());
-    out.extend_from_slice(&crc32(&payload).to_be_bytes());
-    out.extend_from_slice(&payload);
+    let mut out = Vec::with_capacity(ENTRY_HEADER_LEN + key.len() + value.len());
+    encode_entry_into(&mut out, key, flag, value, expire_at);
     out
 }
 
@@ -771,6 +851,89 @@ impl Bitcask {
         active.bytes += entry.len() as u64;
         self.shared.index.write().unwrap().remove(key);
         Ok(())
+    }
+
+    /// 批量写（v1.0）：把一批操作编码进**一个连续缓冲区**，只做一次 `write_all`、
+    /// 只取一次 active 锁、只取一次 index 锁。返回写入的字节数。
+    ///
+    /// 为什么这样更快（对比 N 次 `set`）：
+    ///   - 锁获取：2N 次 -> 2 次（每次 `Mutex::lock` 都是一次原子操作 + 可能的 futex 等待）
+    ///   - 系统调用：N 次 `memcpy` + 缓冲区满时的 `write` -> 1 次 `memcpy` + 少量 `write`
+    ///   - 堆分配：3N 次 -> 约 2 次（一个 batch buffer + 一个变更列表）
+    ///
+    /// **不保证原子性**（重要）：这批操作在磁盘上就是 N 条独立记录。
+    /// 写到一半崩溃，前缀可见、后缀丢失，索引与数据仍然自洽（因为索引只在
+    /// `write_all` 成功后才更新）。想要「这批要么全生效要么全不生效」，
+    /// 需要引入 commit record / WAL 两阶段提交，那是另一个量级的复杂度 ——
+    /// 本版选择「快但只保证前缀可见」，并把这个边界明确写出来。
+    ///
+    /// 批内同一个 key 出现多次时，顺序生效（last-write-wins）。
+    pub fn write_batch(&self, ops: impl IntoIterator<Item = Op>) -> io::Result<u64> {
+        // 阶段一：编码。此时不持任何锁 —— 编码是纯 CPU 活，不该占着锁干
+        let mut buf: Vec<u8> = Vec::new();
+        // 索引变更用「批内偏移」记录，等拿到 active.bytes 后再换算成绝对偏移
+        let mut changes: Vec<(String, Option<(u64, u64)>)> = Vec::new();
+
+        for op in ops {
+            let expire_at = op.expire_at(); // 先算好（&self），再解构转移所有权
+            match op {
+                Op::Put { key, value, .. } => {
+                    let offset_in_batch = buf.len() as u64;
+                    encode_entry_into(&mut buf, &key, FLAG_PUT, &value, expire_at);
+                    changes.push((key, Some((offset_in_batch, expire_at))));
+                }
+                Op::Delete { key } => {
+                    encode_entry_into(&mut buf, &key, FLAG_DEL, &[], 0);
+                    changes.push((key, None));
+                }
+            }
+            if buf.len() > MAX_BATCH_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("batch 超过上限 {MAX_BATCH_BYTES} 字节"),
+                ));
+            }
+        }
+
+        if buf.is_empty() {
+            return Ok(0); // 空批量：不产生任何写入，也不必抢锁
+        }
+
+        // 阶段二：一次写入 + 一次索引更新
+        let mut active = self.shared.active.lock().unwrap();
+        let base = active.bytes;
+        active.writer.write_all(&buf)?; // 只有成功之后才改索引，保证索引不会指向未落盘数据
+        active.bytes += buf.len() as u64;
+
+        let mut index = self.shared.index.write().unwrap();
+        for (key, change) in changes {
+            match change {
+                Some((offset_in_batch, expire_at)) => {
+                    index.insert(
+                        key,
+                        ValuePos {
+                            file_id: ACTIVE_FILE_ID,
+                            offset: base + offset_in_batch,
+                            expire_at,
+                        },
+                    );
+                }
+                None => {
+                    index.remove(&key);
+                }
+            }
+        }
+        Ok(buf.len() as u64)
+    }
+
+    /// `write_batch` 的便捷封装：只写不删时用它更顺手。
+    pub fn set_many<I, K, V>(&self, items: I) -> io::Result<u64>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Vec<u8>>,
+    {
+        self.write_batch(items.into_iter().map(|(k, v)| Op::put(k, v)))
     }
 
     /// 读取一个 key 的最新值。线程安全，可与写、merge 并发。
@@ -2039,5 +2202,154 @@ mod tests {
         assert_eq!(db.get_string("k").unwrap().as_deref(), Some("new"));
         assert_eq!(db.stats().expired_keys, 0);
         assert_eq!(db.len(), 1);
+    }
+
+    // ---------------- v1.0 批量写 ----------------
+
+    #[test]
+    fn test_write_batch_mixed_ops() {
+        let dir = temp_dir("batch-mixed");
+        let db = Bitcask::open(&dir).unwrap();
+
+        db.set("keep", "old").unwrap();
+        db.set("doomed", "x").unwrap();
+
+        let written = db
+            .write_batch(vec![
+                Op::put("a", "1"),
+                Op::put("b", "2"),
+                Op::delete("doomed"),
+                Op::put_with_ttl("later", "3", Duration::from_secs(3600)),
+                Op::delete("never-existed"), // 删不存在的 key 合法
+            ])
+            .unwrap();
+
+        assert!(written > 0);
+        assert_eq!(db.get_string("a").unwrap().as_deref(), Some("1"));
+        assert_eq!(db.get_string("b").unwrap().as_deref(), Some("2"));
+        assert_eq!(db.get_string("doomed").unwrap(), None);
+        assert_eq!(db.get_string("later").unwrap().as_deref(), Some("3"));
+        assert_eq!(db.get_string("keep").unwrap().as_deref(), Some("old"));
+        assert_eq!(db.len(), 4);
+        // 批内的 TTL 也要生效
+        assert!(db.expire_at("later").unwrap() > 0);
+        assert_eq!(db.expire_at("a"), Some(0));
+    }
+
+    #[test]
+    fn test_write_batch_duplicate_keys_last_wins() {
+        let dir = temp_dir("batch-dup");
+        let db = Bitcask::open(&dir).unwrap();
+
+        db.write_batch(vec![
+            Op::put("k", "v1"),
+            Op::put("k", "v2"),
+            Op::put("k", "v3"),
+        ])
+        .unwrap();
+
+        assert_eq!(db.get_string("k").unwrap().as_deref(), Some("v3"));
+        assert_eq!(db.len(), 1);
+
+        // 同一批里先写后删，删生效
+        db.write_batch(vec![Op::put("d", "v"), Op::delete("d")])
+            .unwrap();
+        assert_eq!(db.get_string("d").unwrap(), None);
+        assert_eq!(db.len(), 1);
+    }
+
+    #[test]
+    fn test_write_batch_offsets_are_correct_for_every_key() {
+        let dir = temp_dir("batch-offsets");
+        let db = Bitcask::open(&dir).unwrap();
+
+        // 批内偏移换算最容易错的地方：第 i 条的绝对偏移 = 批起始 + 批内偏移
+        let items: Vec<(String, String)> = (0..500u32)
+            .map(|i| {
+                (
+                    format!("key{i:04}"),
+                    format!("value{i:04}-{}", "z".repeat(i as usize % 40)),
+                )
+            })
+            .collect();
+        db.set_many(items.clone()).unwrap();
+        assert_eq!(db.len(), 500);
+
+        // 逐条校验：偏移错一位就会读出别人的值或 CRC 失败
+        for (k, v) in &items {
+            assert_eq!(
+                db.get_string(k).unwrap().as_deref(),
+                Some(v.as_str()),
+                "key {k} 读出的值不对，说明批内偏移换算有误"
+            );
+        }
+
+        // 第二批紧接在后面写，再次验证 base 偏移的累计
+        db.set_many(vec![("key0000".to_string(), "overwritten".to_string())])
+            .unwrap();
+        assert_eq!(
+            db.get_string("key0000").unwrap().as_deref(),
+            Some("overwritten")
+        );
+        assert_eq!(
+            db.get_string("key0499").unwrap().as_deref(),
+            Some(items[499].1.as_str())
+        );
+    }
+
+    #[test]
+    fn test_write_batch_empty_is_noop() {
+        let dir = temp_dir("batch-empty");
+        let db = Bitcask::open(&dir).unwrap();
+
+        let before = db.stats().total_bytes;
+        assert_eq!(db.write_batch(Vec::new()).unwrap(), 0);
+        assert_eq!(db.stats().total_bytes, before, "空批量不应写任何字节");
+        assert_eq!(db.len(), 0);
+    }
+
+    #[test]
+    fn test_write_batch_survives_reopen_and_merge() {
+        let dir = temp_dir("batch-reopen");
+
+        {
+            let db = Bitcask::open(&dir).unwrap();
+            db.set_many((0..100u32).map(|i| (format!("k{i:03}"), format!("v{i:03}"))))
+                .unwrap();
+            db.write_batch((0..50u32).map(|i| Op::delete(format!("k{i:03}"))))
+                .unwrap();
+            db.sync().unwrap();
+        }
+
+        // 重放：批写进去的就是 N 条普通记录，重放逻辑无需特殊处理
+        let db2 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db2.len(), 50);
+        assert_eq!(db2.get_string("k000").unwrap(), None);
+        assert_eq!(db2.get_string("k050").unwrap().as_deref(), Some("v050"));
+
+        // merge 之后批内偏移全部失效，必须靠 merge 重写重建索引
+        db2.merge().unwrap();
+        assert_eq!(db2.len(), 50);
+        assert_eq!(db2.get_string("k099").unwrap().as_deref(), Some("v099"));
+        db2.sync().unwrap();
+        drop(db2);
+
+        let db3 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db3.len(), 50);
+        assert_eq!(db3.get_string("k075").unwrap().as_deref(), Some("v075"));
+    }
+
+    #[test]
+    fn test_write_batch_set_many_then_range() {
+        let dir = temp_dir("batch-range");
+        let db = Bitcask::open(&dir).unwrap();
+
+        db.set_many((0..20u32).map(|i| (format!("user:{i:02}"), format!("u{i}"))))
+            .unwrap();
+        let rows = db.range("user:05", "user:08").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, "user:05");
+        assert_eq!(rows[2].0, "user:07");
+        assert_eq!(db.scan_prefix("user:").unwrap().len(), 20);
     }
 }

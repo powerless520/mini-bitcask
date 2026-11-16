@@ -11,7 +11,8 @@
 //!
 //! 说明：
 //!   - 所有测量在 release 优化下进行
-//!   - 值长度 128 字节，10 万个 key（约 13 MB 数据），属于小规模缓存友好型负载
+//!   - 值长度 128 字节，10 万个 key（约 14.8 MB 数据），属于小规模缓存友好型负载
+//!   - 额外测量批量写（set_many）与 CRC-32 单项成本，用于把 set 的开销拆开归因
 //!   - 磁盘为 macOS APFS，数据落在系统临时目录（受页缓存影响，非冷启动数字）
 
 use mini_bitcask::Bitcask;
@@ -27,6 +28,8 @@ const VALUE_LEN: usize = 128;
 const ENTRY_OVERHEAD: usize = 21 + 6;
 /// 范围扫描一次覆盖的 key 数
 const SCAN_KEYS: u32 = 10_000;
+/// 批量写每批条数
+const BATCH_SIZE: u32 = 5_000;
 
 fn main() {
     let dir = env::temp_dir().join(format!("mini-bitcask-bench-{}", std::process::id()));
@@ -55,6 +58,39 @@ fn main() {
         black_box(map.insert(format!("key{i:06}"), value.clone()));
     }
     let t_write_base = t.elapsed();
+
+    // ---------- 1b) 批量写（独立数据目录，避免污染后续 merge 测量） ----------
+    // 注意公平性：批量 API 要求 owned value（Op 持有 Vec<u8>），所以这里每条多一次
+    // 128B 的 clone/memcpy，而单条 set 传的是切片。这个对比对批量略不利 —— 即便如此。
+    let dir_batch =
+        env::temp_dir().join(format!("mini-bitcask-bench-batch-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir_batch);
+    let t_write_batch = {
+        let db_batch = Bitcask::open(&dir_batch).expect("open batch");
+        let t = Instant::now();
+        let mut i = 0u32;
+        while i < N_KEYS {
+            let n = BATCH_SIZE.min(N_KEYS - i);
+            let items = (i..i + n).map(|j| (format!("key{j:06}"), value.clone()));
+            db_batch.set_many(items).expect("set_many");
+            i += n;
+        }
+        let elapsed = t.elapsed();
+        assert_eq!(db_batch.len(), N_KEYS as usize);
+        db_batch.sync().expect("sync");
+        elapsed
+    };
+    let _ = fs::remove_dir_all(&dir_batch);
+
+    // ---------- 1c) 成本归因：CRC-32 单独计时 ----------
+    // 一条 128B value 的记录共 155 字节。CRC 是逐字节查表，属于纯 CPU 工作，
+    // 批量写摊薄不了它 —— 这一项解释了 set 与内存基线之间差距的很大一部分。
+    let sample = vec![0xABu8; VALUE_LEN + ENTRY_OVERHEAD];
+    let t = Instant::now();
+    for _ in 0..N_KEYS {
+        black_box(mini_bitcask::crc32(&sample));
+    }
+    let t_crc = t.elapsed();
 
     // ---------- 2) 随机读（命中） ----------
     // 用固定步长的伪随机序，避免排序带来的预取优势
@@ -117,6 +153,29 @@ fn main() {
         SCAN_KEYS as u64,
         t_range,
         Some(t_range_base),
+    );
+
+    // 批量写单独报：不套 BTreeMap 基线，直接和本次的单条 set 对比（同一台机器、同一次运行）
+    let batch_ns = t_write_batch.as_nanos() as f64 / N_KEYS as f64;
+    let single_ns = t_write.as_nanos() as f64 / N_KEYS as f64;
+    println!(
+        "{:<18} {:>9.0} ns/op  {:>10.0} ops/s   | 对比单条 set {:>7.0} ns/op（快 {:.1}x，每批 {} 条）",
+        "批量写 set_many",
+        batch_ns,
+        N_KEYS as f64 / t_write_batch.as_secs_f64(),
+        single_ns,
+        single_ns / batch_ns,
+        BATCH_SIZE
+    );
+
+    // CRC 归因：一条记录 155 字节，逐字节查表
+    let crc_ns = t_crc.as_nanos() as f64 / N_KEYS as f64;
+    println!(
+        "{:<18} {:>9.0} ns/op  {:>10.0} MB/s   | 占单条 set 的 {:.0}%",
+        "CRC-32（155B/条）",
+        crc_ns,
+        (VALUE_LEN + ENTRY_OVERHEAD) as f64 / (crc_ns / 1e9) / 1e6,
+        crc_ns / single_ns * 100.0
     );
 
     println!("\nmerge 压缩");

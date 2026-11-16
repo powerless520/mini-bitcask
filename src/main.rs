@@ -19,7 +19,7 @@ use mini_bitcask::Bitcask;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::exit;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() {
     let dir = match std::env::args().nth(1) {
@@ -39,9 +39,10 @@ fn main() {
         }
     };
 
-    println!("mini-bitcask v0.9 (dir: {})", dir.display());
+    println!("mini-bitcask v1.0 (dir: {})", dir.display());
     println!("命令: set <k> <v> | setex <k> <秒> <v> | get <k> | del <k> | ttl <k>");
-    println!("      list | stats | merge | range <a> <b> | prefix <p> | bloom <k> | exit");
+    println!("      batch <n> <前缀> | list | stats | merge");
+    println!("      range <a> <b> | prefix <p> | bloom <k> | exit");
     println!("共 {} 个存活 key 从日志中恢复", db.len());
 
     let stdin = io::stdin();
@@ -112,6 +113,32 @@ fn main() {
                 }
             },
             ("list", "", _) => Ok(db.keys().join("\n")),
+            // batch <n> <前缀>：生成 n 条 {prefix}{i:06} = {prefix}-value-{i}，每 1000 条一批
+            ("batch", n, prefix) if !n.is_empty() && !prefix.is_empty() => 'batch: {
+                let count: u32 = match n.parse() {
+                    Ok(c) if c > 0 => c,
+                    _ => break 'batch Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "用法: batch <正数条数> <key 前缀>",
+                    )),
+                };
+                let started = Instant::now();
+                let mut bytes = 0u64;
+                for start in (0..count).step_by(1000) {
+                    let end = (start + 1000).min(count);
+                    let items = (start..end)
+                        .map(|i| (format!("{prefix}{i:06}"), format!("{prefix}-value-{i}")));
+                    match db.set_many(items) {
+                        Ok(b) => bytes += b,
+                        Err(e) => break 'batch Err(e),
+                    }
+                }
+                let elapsed = started.elapsed();
+                Ok(format!(
+                    "批量写入 {count} 条，{bytes} 字节，耗时 {elapsed:.2?}（{:.0} ops/s）",
+                    count as f64 / elapsed.as_secs_f64()
+                ))
+            }
             ("stats", "", _) => {
                 let s = db.stats();
                 let mut out = format!(
@@ -161,7 +188,7 @@ fn main() {
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "未知命令，支持: set/setex/get/del/ttl/list/stats/merge/range/prefix/bloom/exit",
+                "未知命令，支持: set/setex/get/del/ttl/batch/list/stats/merge/range/prefix/bloom/exit",
             )),
         };
 
