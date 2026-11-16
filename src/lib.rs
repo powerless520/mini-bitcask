@@ -1,4 +1,4 @@
-//! mini-bitcask —— 一个 ~1010 行的 Bitcask 风格 KV 存储引擎（教学/开源项目）
+//! mini-bitcask —— 一个 ~1210 行的 Bitcask 风格 KV 存储引擎（教学/开源项目）
 //!
 //! 设计模型（来自 Basho/riak 的 Bitcask 论文）：
 //!
@@ -8,15 +8,22 @@
 //!   启动：  重放全部分段 + active.log，重建内存索引
 //!   合并：  merge 把存活数据重写进新分段文件，随后删除旧文件（见 merge()）
 //!
-//! 磁盘条目（entry）二进制布局（大端序）：
+//! 磁盘条目（entry）二进制布局（大端序，v0.9 起）：
 //!
-//!   ┌────────┬──────────┬────────┬──────────────┬─────────────┬─────────────┐
-//!   │  crc   │ key_len  │  flag  │  value_len   │  key bytes  │ value bytes │
-//!   │  u32   │  u32     │  u8    │  u32         │  key_len B  │ value_len B │
-//!   └────────┴──────────┴────────┴──────────────┴─────────────┴─────────────┘
+//!   ┌────────┬──────────┬────────┬──────────────┬────────────┬─────────────┬─────────────┐
+//!   │  crc   │ key_len  │  flag  │  value_len   │  expire_at │  key bytes  │ value bytes │
+//!   │  u32   │  u32     │  u8    │  u32         │  u64       │  key_len B  │ value_len B │
+//!   └────────┴──────────┴────────┴──────────────┴────────────┴─────────────┴─────────────┘
 //!
-//!   crc  = CRC-32（IEEE，多项式 0xEDB88320），覆盖 key_len 起至 value 结尾的全部字节
-//!   flag = 0 表示 PUT，1 表示 DELETE（墓碑，value 为空）
+//!   crc       = CRC-32（IEEE，多项式 0xEDB88320），覆盖 key_len 起至 value 结尾的全部字节
+//!   flag      = 0 表示 PUT，1 表示 DELETE（墓碑，value 为空）
+//!   expire_at = 过期时间（unix 毫秒），0 表示永不过期
+//!
+//! **格式不兼容说明（v0.9 的真实教训）**：
+//! 给 entry 加 expire_at 字段改变了二进制格式，v0.8 及更早版本写入的数据目录
+//! 在 v0.9 下会从第一条记录起 CRC 校验失败，按损坏尾部被整体截断 —— 数据"消失"。
+//! 真实存储引擎因此在每个文件头放 magic + version 字段来识别格式代际。
+//! 本项目选择不做兼容层，把这个代价亲身体验并记录在案 —— 这就是"格式演进"这一课。
 //!
 //! v0.3 文件布局（多文件 / merge，对应 Bitcask 论文 §3）：
 //!
@@ -58,6 +65,15 @@
 //!   它的价值在于 merge 期判断 key 是否可能在某分段、以及为未来 keydir 分区/落盘预留负查询能力。
 //!   因此本版把能力做完整（生成/持久化/恢复/负查询 API），而不是假装它是性能优化。
 //!
+//! v0.9 TTL 过期：entry 增加 expire_at 字段（unix 毫秒，0 = 永不过期）。
+//!
+//!   过期策略 = 惰性删除（lazy expiration），这是有意的取舍：
+//!   - 读路径按索引中的 expire_at 过滤，**零额外 IO**（索引已含该字段）
+//!   - 物理数据不立即删除，等 merge 时才真正丢弃 —— 因此过期 key 在被 merge 前仍占磁盘
+//!   - 为什么不在 get 时顺手写墓碑？那会让读路径产生写操作，
+//!     破坏「多读单写」模型（读线程要抢 active 锁、读放大成写放大）。
+//!     代价是空间回收延迟，用一次 merge 换回来，这个交易值得
+//!
 //! 这是刻意留白的项目：基准测试留作后续演进路线，见 README.md 的 Roadmap。
 
 use std::collections::{BTreeMap, HashMap};
@@ -83,8 +99,25 @@ const MERGE_TMP_PREFIX: &str = "merge-";
 /// active.log 在索引中使用的 file_id
 const ACTIVE_FILE_ID: u64 = 0;
 
-/// 一条 entry 的解析结果：(key, flag, value, entry 总字节数)
-type Entry = (String, u8, Vec<u8>, u64);
+/// 时间相关的导入（TTL 用）
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// entry 头中的固定部分：crc(4) + key_len(4) + flag(1) + value_len(4) + expire_at(8)
+const ENTRY_HEADER_LEN: usize = 21;
+/// hint 头中的固定部分：key_len(4) + value_len(4) + entry_len(4) + offset(8) + expire_at(8)
+const HINT_HEADER_LEN: usize = 28;
+
+/// 一条 entry 的解析结果。
+#[derive(Debug, Clone)]
+struct Entry {
+    key: String,
+    flag: u8,
+    value: Vec<u8>,
+    /// 过期时间（unix 毫秒），0 = 永不过期
+    expire_at: u64,
+    /// entry 在磁盘上的总字节数
+    len: u64,
+}
 
 /// 内存索引（keydir）：key 有序存储，支持范围查询与前缀扫描。
 type KeyDir = BTreeMap<String, ValuePos>;
@@ -96,6 +129,22 @@ struct ValuePos {
     file_id: u64,
     /// entry 起始偏移量
     offset: u64,
+    /// 过期时间（unix 毫秒），0 = 永不过期。
+    /// 索引里带上它，过期判断就不用读盘 —— 这是惰性删除能做到零 IO 的前提
+    expire_at: u64,
+}
+
+/// 当前时间（unix 毫秒）。系统时钟回拨时返回 0（等价于"不过期"，绝不误删）。
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 该过期时间是否已到期。0 约定为"永不过期"，是 TTL 设计里最容易被忽略的边界。
+fn is_expired(expire_at: u64) -> bool {
+    expire_at != 0 && expire_at <= now_ms()
 }
 
 // ---------------- 编码与 CRC ----------------
@@ -131,11 +180,12 @@ fn invalid_data(msg: impl Into<String>) -> io::Error {
 }
 
 /// 把一条记录编码成完整的磁盘字节流（crc + payload）。
-fn encode_entry(key: &str, flag: u8, value: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(9 + key.len() + value.len());
+fn encode_entry(key: &str, flag: u8, value: &[u8], expire_at: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(17 + key.len() + value.len());
     payload.extend_from_slice(&(key.len() as u32).to_be_bytes());
     payload.push(flag);
     payload.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&expire_at.to_be_bytes());
     payload.extend_from_slice(key.as_bytes());
     payload.extend_from_slice(value);
 
@@ -147,16 +197,26 @@ fn encode_entry(key: &str, flag: u8, value: &[u8]) -> Vec<u8> {
 
 /// 把一条 hint 记录编码成磁盘字节流（不含 value，这是 hint 省空间的关键）：
 ///
-///   ┌──────────┬────────────┬─────────────┬──────────┬────────────┐
-///   │  key_len │  value_len │  entry_len  │  offset  │  key bytes │
-///   │   u32    │    u32     │    u32      │   u64    │  key_len B │
-///   └──────────┴────────────┴─────────────┴──────────┴────────────┘
-fn encode_hint_entry(key: &str, value_len: usize, entry_len: u64, offset: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(20 + key.len());
+///   ┌──────────┬────────────┬─────────────┬──────────┬────────────┬────────────┐
+///   │  key_len │  value_len │  entry_len  │  offset  │ expire_at  │  key bytes │
+///   │   u32    │    u32     │    u32      │   u64    │    u64     │  key_len B │
+///   └──────────┴────────────┴─────────────┴──────────┴────────────┴────────────┘
+///
+/// v0.9 起 hint 也带 expire_at：否则从 hint 恢复的索引会丢失过期信息，
+/// 重启后过期 key 会"复活" —— 这是索引备份最容易出的错。
+fn encode_hint_entry(
+    key: &str,
+    value_len: usize,
+    entry_len: u64,
+    offset: u64,
+    expire_at: u64,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HINT_HEADER_LEN + key.len());
     out.extend_from_slice(&(key.len() as u32).to_be_bytes());
     out.extend_from_slice(&(value_len as u32).to_be_bytes());
     out.extend_from_slice(&(entry_len as u32).to_be_bytes());
     out.extend_from_slice(&offset.to_be_bytes());
+    out.extend_from_slice(&expire_at.to_be_bytes());
     out.extend_from_slice(key.as_bytes());
     out
 }
@@ -231,8 +291,8 @@ fn load_index_from_hint(
     }
 
     loop {
-        // header：key_len + value_len + entry_len + offset = 20 字节
-        let mut header = [0u8; 20];
+        // header：key_len + value_len + entry_len + offset + expire_at = 28 字节
+        let mut header = [0u8; HINT_HEADER_LEN];
         if !try_hint_read!(&mut header) {
             return Ok(true); // 干净 EOF：整个 hint 有效
         }
@@ -242,6 +302,10 @@ fn load_index_from_hint(
         let offset = u64::from_be_bytes([
             header[12], header[13], header[14], header[15], header[16], header[17], header[18],
             header[19],
+        ]);
+        let expire_at = u64::from_be_bytes([
+            header[20], header[21], header[22], header[23], header[24], header[25], header[26],
+            header[27],
         ]);
 
         const MAX_KEY: usize = 1 << 20;
@@ -261,7 +325,14 @@ fn load_index_from_hint(
             Err(_) => return Ok(false),
         };
 
-        index.insert(key, ValuePos { file_id, offset });
+        index.insert(
+            key,
+            ValuePos {
+                file_id,
+                offset,
+                expire_at,
+            },
+        );
     }
 }
 
@@ -561,17 +632,24 @@ impl Bitcask {
         let mut offset: u64 = 0;
         loop {
             match Self::read_entry_at(file, offset) {
-                Ok(Some((key, flag, _value, entry_len))) => {
-                    match flag {
+                Ok(Some(entry)) => {
+                    match entry.flag {
                         FLAG_PUT => {
-                            index.insert(key, ValuePos { file_id, offset });
+                            index.insert(
+                                entry.key,
+                                ValuePos {
+                                    file_id,
+                                    offset,
+                                    expire_at: entry.expire_at,
+                                },
+                            );
                         }
                         FLAG_DEL => {
-                            index.remove(&key);
+                            index.remove(&entry.key);
                         }
                         _ => break, // 未知 flag：损坏
                     }
-                    offset += entry_len;
+                    offset += entry.len;
                 }
                 Ok(None) => break, // EOF / 脏尾
                 Err(e) if e.kind() == io::ErrorKind::InvalidData => break, // CRC 失败等
@@ -587,8 +665,8 @@ impl Bitcask {
     fn read_entry_at(reader: &mut File, offset: u64) -> io::Result<Option<Entry>> {
         reader.seek(SeekFrom::Start(offset))?;
 
-        // header：crc(u32) + key_len(u32) + flag(u8) + value_len(u32) = 13 字节
-        let mut header = [0u8; 13];
+        // header：crc(u32) + key_len(u32) + flag(u8) + value_len(u32) + expire_at(u64)
+        let mut header = [0u8; ENTRY_HEADER_LEN];
         match reader.read_exact(&mut header) {
             Ok(()) => {}
             Err(_) => return Ok(None), // EOF / 脏尾
@@ -598,6 +676,10 @@ impl Bitcask {
         let flag = header[8];
         let value_len =
             u32::from_be_bytes([header[9], header[10], header[11], header[12]]) as usize;
+        let expire_at = u64::from_be_bytes([
+            header[13], header[14], header[15], header[16], header[17], header[18], header[19],
+            header[20],
+        ]);
 
         // 防御性校验：防止损坏日志导致疯狂分配内存
         const MAX_KEY: usize = 1 << 20; // 1 MiB
@@ -608,20 +690,27 @@ impl Bitcask {
             ));
         }
 
-        // payload = key_len+flag+value_len 这 9 字节 + key + value（crc 覆盖它全部）
-        let mut payload = vec![0u8; 9 + key_len + value_len];
-        payload[..9].copy_from_slice(&header[4..13]);
-        reader.read_exact(&mut payload[9..])?;
+        // payload = header 去掉 crc 的部分 + key + value（crc 覆盖它全部）
+        const PAYLOAD_FIXED: usize = ENTRY_HEADER_LEN - 4; // 17 字节
+        let mut payload = vec![0u8; PAYLOAD_FIXED + key_len + value_len];
+        payload[..PAYLOAD_FIXED].copy_from_slice(&header[4..]);
+        reader.read_exact(&mut payload[PAYLOAD_FIXED..])?;
 
         if crc32(&payload) != expected_crc {
             return Err(invalid_data("corrupt entry: CRC mismatch"));
         }
 
-        let key = payload[9..9 + key_len].to_vec();
-        let value = payload[9 + key_len..].to_vec();
+        let key = payload[PAYLOAD_FIXED..PAYLOAD_FIXED + key_len].to_vec();
+        let value = payload[PAYLOAD_FIXED + key_len..].to_vec();
         let key =
             String::from_utf8(key).map_err(|_| invalid_data("corrupt entry: key is not UTF-8"))?;
-        Ok(Some((key, flag, value, (13 + key_len + value_len) as u64)))
+        Ok(Some(Entry {
+            key,
+            flag,
+            value,
+            expire_at,
+            len: (ENTRY_HEADER_LEN + key_len + value_len) as u64,
+        }))
     }
 
     /// 写入一个键值对（覆盖即追加新版本，旧值成为垃圾数据）。
@@ -629,10 +718,32 @@ impl Bitcask {
     /// 并发语义：active 锁内完成"追加 + 更新索引"，保证多线程下
     /// 同一个 key 的索引永远指向最后完成的那次写入（last-write-wins）。
     pub fn set(&self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> io::Result<()> {
-        let key = key.into();
-        let value = value.into();
+        self.set_entry(key.into(), value.into(), 0)
+    }
 
-        let entry = encode_entry(&key, FLAG_PUT, &value);
+    /// 写入一个带 TTL 的键值对：`ttl` 秒后过期（惰性删除，见模块文档）。
+    ///
+    /// 两种边界行为值得注意：
+    /// - `ttl == 0` 等价于永不过期（与 `set` 一致），而不是"立即过期"——
+    ///   后者虽直觉上更"合理"，但会让 `set_with_ttl(k, v, 0)` 变成一个奇怪的删除 API
+    /// - 过期后**不会**自动写入墓碑：`get` 直接返回 None，磁盘空间等 merge 回收
+    pub fn set_with_ttl(
+        &self,
+        key: impl Into<String>,
+        value: impl Into<Vec<u8>>,
+        ttl: std::time::Duration,
+    ) -> io::Result<()> {
+        let expire_at = if ttl.is_zero() {
+            0
+        } else {
+            now_ms().saturating_add(ttl.as_millis() as u64)
+        };
+        self.set_entry(key.into(), value.into(), expire_at)
+    }
+
+    /// 写路径的唯一实现：set / set_with_ttl 都落到这里。
+    fn set_entry(&self, key: String, value: Vec<u8>, expire_at: u64) -> io::Result<()> {
+        let entry = encode_entry(&key, FLAG_PUT, &value, expire_at);
         // 锁顺序：active -> index
         let mut active = self.shared.active.lock().unwrap();
         let offset = active.bytes;
@@ -643,6 +754,7 @@ impl Bitcask {
             ValuePos {
                 file_id: ACTIVE_FILE_ID,
                 offset,
+                expire_at,
             },
         );
         Ok(())
@@ -653,7 +765,7 @@ impl Bitcask {
     pub fn delete(&self, key: impl AsRef<str>) -> io::Result<()> {
         let key = key.as_ref();
 
-        let entry = encode_entry(key, FLAG_DEL, &[]);
+        let entry = encode_entry(key, FLAG_DEL, &[], 0);
         let mut active = self.shared.active.lock().unwrap();
         active.writer.write_all(&entry)?;
         active.bytes += entry.len() as u64;
@@ -676,6 +788,12 @@ impl Bitcask {
         }) else {
             return Ok(None);
         };
+
+        // v0.9：惰性过期 —— 索引里就有 expire_at，判断过期不需要碰磁盘。
+        // 这是把 expire_at 放进索引（而非只放磁盘 entry）换来的直接收益
+        if is_expired(pos.expire_at) {
+            return Ok(None);
+        }
 
         // 最多重试 3 次（正常情况下 1 次就命中）
         for _attempt in 0..3u32 {
@@ -700,8 +818,21 @@ impl Bitcask {
             };
 
             match result {
-                Ok(Some((k, FLAG_PUT, value, _))) if k == key => return Ok(Some(value)),
-                Ok(Some((k, FLAG_DEL, _, _))) if k == key => return Ok(None),
+                // 磁盘上的 expire_at 是权威值：索引可能来自 hint（同源，理论上一致），
+                // 但读路径再校验一次的成本是 0，收益是"索引与数据不一致时不会返回过期值"
+                Ok(Some(entry))
+                    if entry.key == key
+                        && entry.flag == FLAG_PUT
+                        && !is_expired(entry.expire_at) =>
+                {
+                    return Ok(Some(entry.value));
+                }
+                Ok(Some(entry))
+                    if entry.key == key
+                        && (entry.flag == FLAG_DEL || is_expired(entry.expire_at)) =>
+                {
+                    return Ok(None);
+                }
                 // 读到 EOF / 另一个 key 的记录（位置过期）-> 重读索引
                 Ok(Some(_)) | Ok(None) => {
                     let index = self.shared.index.read().unwrap();
@@ -763,34 +894,36 @@ impl Bitcask {
         let mut active = self.shared.active.lock().unwrap();
         active.writer.flush()?;
 
+        // v0.9：已过期的 key 直接跳过 —— merge 就是惰性删除的"物理清算"环节。
+        // 这也解释了为什么过期数据在 merge 之前仍占磁盘：空间回收本就该批量做
         let snapshot: Vec<(String, ValuePos)> = {
             let index = self.shared.index.read().unwrap();
-            index.iter().map(|(k, v)| (k.clone(), *v)).collect()
+            index
+                .iter()
+                .filter(|(_, v)| !is_expired(v.expire_at))
+                .map(|(k, v)| (k.clone(), *v))
+                .collect()
         };
 
         // 1) 先把存活数据全部读到内存（只在持锁期间读，随后释放）
-        let mut live: Vec<(String, Vec<u8>)> = Vec::with_capacity(snapshot.len());
+        let mut live: Vec<(String, Vec<u8>, u64)> = Vec::with_capacity(snapshot.len());
         {
             let segments = self.shared.segments.read().unwrap();
             for (key, pos) in &snapshot {
-                let value = if pos.file_id == ACTIVE_FILE_ID {
-                    let (_, _, value, _) = Self::read_entry_at(&mut active.reader, pos.offset)?
-                        .ok_or_else(|| {
-                            invalid_data(format!("merge failed: missing data for key {key:?}"))
-                        })?;
-                    value
+                let entry = if pos.file_id == ACTIVE_FILE_ID {
+                    Self::read_entry_at(&mut active.reader, pos.offset)?
                 } else {
                     let segment = segments.get(&pos.file_id).ok_or_else(|| {
                         invalid_data(format!("merge failed: segment {} missing", pos.file_id))
                     })?;
                     let mut reader = segment.file.lock().unwrap();
-                    let (_, _, value, _) = Self::read_entry_at(&mut reader, pos.offset)?
-                        .ok_or_else(|| {
-                            invalid_data(format!("merge failed: missing data for key {key:?}"))
-                        })?;
-                    value
+                    Self::read_entry_at(&mut reader, pos.offset)?
                 };
-                live.push((key.clone(), value));
+                let entry = entry.ok_or_else(|| {
+                    invalid_data(format!("merge failed: missing data for key {key:?}"))
+                })?;
+                // 以磁盘上的 expire_at 为准重写，避免索引与数据不一致时把过期值"续命"
+                live.push((key.clone(), entry.value, entry.expire_at));
             }
         }
 
@@ -813,7 +946,7 @@ impl Bitcask {
 
         // v0.7：为新分段构建布隆过滤器（目标误判率 1%）
         let mut bloom = Bloom::with_capacity(live.len(), 0.01);
-        for (key, _) in &live {
+        for (key, _, _) in &live {
             bloom.insert(key.as_bytes());
         }
 
@@ -835,8 +968,8 @@ impl Bitcask {
                 .open(&hint_tmp_path)?;
             let mut hint_writer = BufWriter::new(hint_file);
 
-            for (key, value) in &live {
-                let entry = encode_entry(key, FLAG_PUT, value);
+            for (key, value, expire_at) in &live {
+                let entry = encode_entry(key, FLAG_PUT, value, *expire_at);
                 tmp_writer.write_all(&entry)?;
                 // hint 记录这条数据在新分段中的位置，value 本身不写
                 hint_writer.write_all(&encode_hint_entry(
@@ -844,12 +977,14 @@ impl Bitcask {
                     value.len(),
                     entry.len() as u64,
                     offset,
+                    *expire_at,
                 ))?;
                 new_index.insert(
                     key.clone(),
                     ValuePos {
                         file_id: new_id,
                         offset,
+                        expire_at: *expire_at,
                     },
                 );
                 offset += entry.len() as u64;
@@ -912,8 +1047,13 @@ impl Bitcask {
     /// 它是为 keydir 分区/落盘场景准备的负查询加速能力，也可用于外部批量校验。
     pub fn may_contain(&self, key: impl AsRef<str>) -> bool {
         let key = key.as_ref();
-        if self.shared.index.read().unwrap().contains_key(key) {
-            return true;
+        {
+            let index = self.shared.index.read().unwrap();
+            if let Some(pos) = index.get(key) {
+                // 索引里就有答案，不需要问 bloom：
+                // 未过期 -> 一定存在；已过期 -> 逻辑上已不存在（惰性删除的语义）
+                return !is_expired(pos.expire_at);
+            }
         }
         let kb = key.as_bytes();
         let segments = self.shared.segments.read().unwrap();
@@ -924,9 +1064,14 @@ impl Bitcask {
     }
 
     /// 所有存活 key（BTreeMap 天然有序，无需额外排序）。
+    /// v0.9：已过期的 key 不在其中（惰性删除对外表现为"已消失"）。
     pub fn keys(&self) -> Vec<String> {
         let index = self.shared.index.read().unwrap();
-        index.keys().cloned().collect()
+        index
+            .iter()
+            .filter(|(_, pos)| !is_expired(pos.expire_at))
+            .map(|(k, _)| k.clone())
+            .collect()
     }
 
     /// 范围扫描 `[start, end)`：按 key 升序返回键值对（左闭右开，与 BTreeMap::range 一致）。
@@ -940,6 +1085,7 @@ impl Bitcask {
             let index = self.shared.index.read().unwrap();
             index
                 .range(start.to_owned()..end.to_owned())
+                .filter(|(_, pos)| !is_expired(pos.expire_at))
                 .map(|(k, _)| k.clone())
                 .collect()
         };
@@ -954,6 +1100,7 @@ impl Bitcask {
             index
                 .range(prefix.to_owned()..)
                 .take_while(|(k, _)| k.starts_with(prefix))
+                .filter(|(_, pos)| !is_expired(pos.expire_at))
                 .map(|(k, _)| k.clone())
                 .collect()
         };
@@ -971,16 +1118,40 @@ impl Bitcask {
         Ok(out)
     }
 
+    /// 是否存在（已过期的 key 视为不存在）。
     pub fn contains_key(&self, key: impl AsRef<str>) -> bool {
-        self.shared.index.read().unwrap().contains_key(key.as_ref())
+        let index = self.shared.index.read().unwrap();
+        index
+            .get(key.as_ref())
+            .is_some_and(|pos| !is_expired(pos.expire_at))
     }
 
+    /// 存活 key 数量（不含已过期但尚未被 merge 清理的 key）。
     pub fn len(&self) -> usize {
-        self.shared.index.read().unwrap().len()
+        let index = self.shared.index.read().unwrap();
+        index
+            .values()
+            .filter(|pos| !is_expired(pos.expire_at))
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// 查询某个 key 的过期时间戳（unix 毫秒）。
+    ///
+    ///   - `None`     -> key 不存在（或已过期）
+    ///   - `Some(0)`  -> 存在且永不过期
+    ///   - `Some(ts)` -> 存在，将在 ts 到期
+    ///
+    /// 只查内存索引，不产生磁盘 IO —— 这也说明 TTL 的读开销几乎为零。
+    pub fn expire_at(&self, key: impl AsRef<str>) -> Option<u64> {
+        let index = self.shared.index.read().unwrap();
+        index
+            .get(key.as_ref())
+            .filter(|pos| !is_expired(pos.expire_at))
+            .map(|pos| pos.expire_at)
     }
 
     /// 强制把内核缓冲区刷到磁盘。
@@ -1008,8 +1179,12 @@ impl Bitcask {
             .values()
             .filter_map(|s| s.file.lock().unwrap().metadata().ok().map(|m| m.len()))
             .sum();
+        // v0.9：live_keys 只数未过期的；已过期但还在索引里的单独报出来，
+        // 让"该 merge 了"这件事有可观测信号
+        let expired_keys = index.values().filter(|p| is_expired(p.expire_at)).count();
         Stats {
-            live_keys: index.len(),
+            live_keys: index.len() - expired_keys,
+            expired_keys,
             active_bytes,
             segment_count: segments.len(),
             total_bytes: seg_bytes + active_bytes,
@@ -1022,8 +1197,10 @@ impl Bitcask {
 /// 简单统计信息。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
-    /// 内存索引中的存活 key 数
+    /// 内存索引中的存活 key 数（不含已过期的）
     pub live_keys: usize,
+    /// 已过期但尚未被 merge 清理的 key 数（惰性删除的"待清算"量）
+    pub expired_keys: usize,
     /// active.log 字节数
     pub active_bytes: u64,
     /// 只读分段文件数量
@@ -1686,5 +1863,181 @@ mod tests {
             db2.get_string("key0599").unwrap().as_deref(),
             Some("value0599")
         );
+    }
+
+    // ---------------- v0.9 TTL 过期 ----------------
+
+    /// 直接写入一个"已经过期"的 entry（expire_at = 1ms，即 1970 年）。
+    /// 用这种方式测试过期，比 sleep 更确定 —— 时间是测试里最不可靠的依赖。
+    fn put_already_expired(db: &Bitcask, key: &str, value: &str) {
+        db.set_entry(key.to_string(), value.as_bytes().to_vec(), 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_expired_key_invisible_to_every_read_api() {
+        let dir = temp_dir("ttl-invisible");
+        let db = Bitcask::open(&dir).unwrap();
+
+        db.set("live", "yes").unwrap();
+        put_already_expired(&db, "dead", "gone");
+
+        // 逐个确认所有读视图都看不见过期 key
+        assert_eq!(db.get_string("dead").unwrap(), None);
+        assert!(!db.contains_key("dead"));
+        assert_eq!(db.len(), 1);
+        assert_eq!(db.keys(), vec!["live".to_string()]);
+        assert_eq!(db.range("a", "z").unwrap().len(), 1);
+        assert_eq!(db.scan_prefix("d").unwrap().len(), 0);
+        // 逻辑上不存在 -> 负查询也应返回 false
+        assert!(!db.may_contain("dead"));
+
+        // 但磁盘上它还在，stats 把这种"待清算"量报出来
+        let st = db.stats();
+        assert_eq!(st.live_keys, 1);
+        assert_eq!(st.expired_keys, 1);
+    }
+
+    #[test]
+    fn test_ttl_default_never_expires() {
+        let dir = temp_dir("ttl-default");
+
+        {
+            let db = Bitcask::open(&dir).unwrap();
+            db.set("plain", "forever").unwrap();
+            // ttl = 0 约定为永不过期（不是"立即过期"）
+            db.set_with_ttl("zero", "forever", Duration::ZERO).unwrap();
+            db.set_with_ttl("hour", "later", Duration::from_secs(3600))
+                .unwrap();
+            db.sync().unwrap();
+        }
+
+        let db2 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db2.len(), 3);
+        assert_eq!(db2.get_string("plain").unwrap().as_deref(), Some("forever"));
+        assert_eq!(db2.get_string("zero").unwrap().as_deref(), Some("forever"));
+        assert_eq!(db2.get_string("hour").unwrap().as_deref(), Some("later"));
+        assert_eq!(db2.stats().expired_keys, 0);
+    }
+
+    #[test]
+    fn test_ttl_expires_in_real_time() {
+        let dir = temp_dir("ttl-realtime");
+        let db = Bitcask::open(&dir).unwrap();
+
+        db.set_with_ttl("token", "abc", Duration::from_millis(60))
+            .unwrap();
+        // 未到期时正常可读
+        assert_eq!(db.get_string("token").unwrap().as_deref(), Some("abc"));
+
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(db.get_string("token").unwrap(), None);
+        assert!(!db.contains_key("token"));
+        assert_eq!(db.len(), 0);
+    }
+
+    #[test]
+    fn test_ttl_survives_reopen_via_replay() {
+        let dir = temp_dir("ttl-replay");
+
+        {
+            let db = Bitcask::open(&dir).unwrap();
+            db.set("live", "v").unwrap();
+            put_already_expired(&db, "dead", "v");
+            db.sync().unwrap();
+        }
+
+        // 重放路径（无 hint）也必须恢复过期信息，否则过期 key 会"复活"
+        let db2 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db2.len(), 1);
+        assert_eq!(db2.get_string("dead").unwrap(), None);
+        assert_eq!(db2.stats().expired_keys, 1);
+
+        // 活着的 key 的 expire_at 也要跨重启保留
+        db2.set_with_ttl("future", "v", Duration::from_secs(3600))
+            .unwrap();
+        db2.sync().unwrap();
+        drop(db2);
+        let db3 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db3.get_string("future").unwrap().as_deref(), Some("v"));
+    }
+
+    #[test]
+    fn test_ttl_survives_reopen_via_hint() {
+        let dir = temp_dir("ttl-hint");
+
+        {
+            let db = Bitcask::open(&dir).unwrap();
+            db.set("live", "v").unwrap();
+            db.set_with_ttl("future", "v", Duration::from_secs(3600))
+                .unwrap();
+            put_already_expired(&db, "dead", "v");
+            db.merge().unwrap(); // 生成 hint（过期 key 被顺手清掉）
+            db.sync().unwrap();
+        }
+
+        // 走 hint 快速路径：expire_at 必须一起恢复
+        assert!(dir.join(hint_file_name(1)).exists());
+        let db2 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db2.get_string("future").unwrap().as_deref(), Some("v"));
+        // merge 已经把过期数据物理清掉了
+        assert_eq!(db2.stats().expired_keys, 0);
+        assert_eq!(db2.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_reclaims_expired_space() {
+        let dir = temp_dir("ttl-merge");
+        let db = Bitcask::open(&dir).unwrap();
+
+        let value = vec![7u8; 1024];
+        for i in 0..10u32 {
+            db.set(format!("dead{i}"), value.clone()).unwrap();
+        }
+        // 把这 10 个 key 全部改成"已过期"（覆盖写，旧版本变垃圾，新版本立即过期）
+        for i in 0..10u32 {
+            db.set_entry(format!("dead{i}"), value.clone(), 1).unwrap();
+        }
+        for i in 0..3u32 {
+            db.set(format!("live{i}"), value.clone()).unwrap();
+        }
+
+        assert_eq!(db.len(), 3);
+        assert_eq!(db.stats().expired_keys, 10);
+
+        let (before, after) = db.merge().unwrap();
+        assert!(
+            after < before / 2,
+            "merge 应回收过期数据: {before} -> {after}"
+        );
+
+        let st = db.stats();
+        assert_eq!(st.live_keys, 3);
+        assert_eq!(st.expired_keys, 0, "merge 后索引里不应再有过期 key");
+        assert_eq!(db.len(), 3);
+        // 过期 key 从索引消失后，负查询也没有残留
+        assert!(!db.may_contain("dead0"));
+
+        // 重启后依然是 3 个
+        db.sync().unwrap();
+        drop(db);
+        let db2 = Bitcask::open(&dir).unwrap();
+        assert_eq!(db2.len(), 3);
+        assert_eq!(db2.get("live0").unwrap().map(|v| v.len()), Some(1024));
+    }
+
+    #[test]
+    fn test_expired_overwritten_by_new_set() {
+        let dir = temp_dir("ttl-resurrect");
+        let db = Bitcask::open(&dir).unwrap();
+
+        put_already_expired(&db, "k", "old");
+        assert_eq!(db.get_string("k").unwrap(), None);
+
+        // 过期 key 可以正常被重新写入（不是墓碑，不阻塞后续写）
+        db.set("k", "new").unwrap();
+        assert_eq!(db.get_string("k").unwrap().as_deref(), Some("new"));
+        assert_eq!(db.stats().expired_keys, 0);
+        assert_eq!(db.len(), 1);
     }
 }

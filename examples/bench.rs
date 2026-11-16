@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 
 const N_KEYS: u32 = 100_000;
 const VALUE_LEN: usize = 128;
+/// 单条 entry 的额外开销：21 字节 header + 6 字节 key（"key000000"）
+const ENTRY_OVERHEAD: usize = 21 + 6;
 /// 范围扫描一次覆盖的 key 数
 const SCAN_KEYS: u32 = 10_000;
 
@@ -33,7 +35,7 @@ fn main() {
     println!("mini-bitcask 基准测试");
     println!(
         "  数据规模: {N_KEYS} keys x {VALUE_LEN}B values (~{:.1} MB)",
-        (N_KEYS as f64 * (VALUE_LEN + 20) as f64) / 1024.0 / 1024.0
+        (N_KEYS as f64 * (VALUE_LEN + ENTRY_OVERHEAD) as f64) / 1024.0 / 1024.0
     );
     println!("  注意: 单次运行、无置信区间，仅用于量级对比\n");
 

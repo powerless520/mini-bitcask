@@ -1,6 +1,6 @@
 # mini-bitcask
 
-> 用纯 Rust（零依赖，仅 std）实现的 Bitcask 风格 KV 存储引擎，核心约 1020 行（含 24 个测试共 1665 行）。
+> 用纯 Rust（零依赖，仅 std）实现的 Bitcask 风格 KV 存储引擎，核心约 1210 行（含 31 个测试共 2043 行）。
 > 这是一个**学习型开源项目**：目标不是和 RocksDB 竞争，而是把「造存储引擎」的全过程开源出来。
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)](https://www.rust-lang.org/)
@@ -62,6 +62,61 @@ user:2 = bob
 
 注意：字符串字典序下 `user:10` 排在 `user:2` 之前——想要数值序请用零填充 key。
 
+## TTL 过期
+
+```rust
+// 60 秒后过期
+db.set_with_ttl("token", "abc", Duration::from_secs(60))?;
+db.get("token")?;  // Some("abc")
+
+// 61 秒后
+db.get("token")?;  // None —— 读路径按索引里的 expire_at 过滤，一次磁盘 IO 都不产生
+```
+
+语义（三个容易踩的边界）：
+
+- `ttl == 0` 等价于**永不过期**，而不是"立即过期"——后者会让 `set_with_ttl(k, v, 0)` 变成一个语义诡异的删除 API
+- `expire_at` 放在**内存索引里**，所以过期判断是纯内存操作；磁盘 entry 里也存一份，作为重启/hint 恢复时的权威来源
+- 过期**不是墓碑**：过期的 key 可以正常被重新 `set`，不会阻塞后续写入
+
+**惰性删除的取舍**：读视图（`get` / `keys` / `range` / `prefix` / `len` / `contains_key` / `may_contain`）
+立刻看不到过期 key，但磁盘空间要等 `merge` 才真正回收。为什么不在 `get` 时顺手写墓碑？
+
+1. 那会让读路径产生写操作 —— 读放大变写放大，读线程还得抢 active 写锁，直接破坏「多读单写」模型
+2. 空间回收本来就该批量做：一次 merge 一次 `fsync`，比每条过期数据各写一次便宜得多
+
+代价是过期数据在 merge 前持续占盘。`stats().expired_keys` 就是这个「待清算量」的可观测信号：
+
+```
+> setex token 60 abc
+OK (key=token, ttl=60s)
+> ttl token
+剩余 60.0s（到期时间戳 1794813504013）
+> ttl plain
+永不过期
+> ttl nope
+(nil)
+```
+
+```
+# 1 秒 TTL 的 key 过期后
+> stats
+live_keys=2 expired=1 total_bytes=88 (~0.1 KiB) segments=0 active=88 B blooms=0 [有已过期 key 待 merge 回收空间]
+> merge
+merge 完成: 88 B -> 62 B (压缩到 70.5%)
+> stats
+live_keys=2 expired=0 total_bytes=62 segments=1 active=0 B blooms=1
+```
+
+## 格式演进：v0.9 不向下兼容
+
+给 entry 加 `expire_at` 改变了二进制布局（entry header 13 → 21 字节，hint header 20 → 28 字节）。
+**v0.8 及更早版本写的数据目录，在 v0.9 下会从第一条记录起 CRC 校验失败，被当作损坏尾部整体截断。**
+
+这不是 bug，而是真实存储引擎的日常。所以生产级实现都在每个文件头放 `magic + version`，
+启动时识别格式代际，再决定迁移还是拒绝服务。本项目故意不做兼容层 —— 用一次真实的数据不兼容，
+把「为什么需要文件格式版本号」这件事从抽象说教变成亲身经历。
+
 ## 快速开始
 
 ```bash
@@ -73,10 +128,10 @@ cargo run -- ./mydata
 ```
 
 ```
-mini-bitcask v0.8 (dir: ./mydata)
-命令: set <k> <v> | get <k> | del <k> | list | stats
-      merge | range <a> <b> | prefix <p> | bloom <k> | exit
-共 0 个 key 从日志中恢复
+mini-bitcask v0.9 (dir: ./mydata)
+命令: set <k> <v> | setex <k> <秒> <v> | get <k> | del <k> | ttl <k>
+      list | stats | merge | range <a> <b> | prefix <p> | bloom <k> | exit
+共 0 个存活 key 从日志中恢复
 > set user alice
 OK (key=user)
 > set user bob
@@ -84,9 +139,9 @@ OK (key=user)
 > set lang rust
 OK (key=lang)
 > stats
-live_keys=2 total_bytes=63 (~0.1 KiB) segments=0 active=63 B blooms=0
+live_keys=2 expired=0 total_bytes=87 (~0.1 KiB) segments=0 active=87 B blooms=0
 > merge
-merge 完成: 63 B -> 41 B (压缩到 65.1%)
+merge 完成: 87 B -> 57 B (压缩到 65.5%)
 > get user
 bob
 > prefix l
@@ -114,7 +169,7 @@ merge 不是"原地覆写"，而是经典的三步走：
 
 | 文件 | 内容 | 学习点 |
 |------|------|--------|
-| `src/lib.rs` | 引擎核心 | append-only 文件设计、二进制协议编码、CRC 校验、多文件 merge、`O_APPEND` 偏移量陷阱 |
+| `src/lib.rs` | 引擎核心 | append-only 文件设计、二进制协议编码、CRC 校验、多文件 merge、`O_APPEND` 偏移量陷阱、惰性删除 |
 | `src/main.rs` | REPL CLI | `std::io` 交互、错误处理 |
 | `examples/bench.rs` | 零依赖基准 | 手写计时、`black_box` 防优化、和内存基线对打的方法论 |
 
@@ -123,6 +178,7 @@ merge 不是"原地覆写"，而是经典的三步走：
 1. **零依赖**：序列化用裸的字节序编码（大端），让你看清“协议”的本质
 2. **脏尾容忍**：`read_entry_at` 读到不完整条目时静默停止 —— 崩溃后最后一半写入会被丢弃（这正是 append-only 的崩溃安全性）
 3. **防御性长度校验**：`MAX_KEY` / `MAX_VALUE` 上限，防止损坏日志触发疯狂内存分配
+4. **惰性删除**：TTL 过期只在读视图过滤，物理回收交给 merge —— 用一次真实取舍讲清"读路径不该写"这条原则
 
 ## Roadmap（每个课题都是一个独立 PR）
 
@@ -152,6 +208,20 @@ merge 不是"原地覆写"，而是经典的三步走：
       merge 压缩比与 hint 重启耗时同场测量。
       **诚实说明**：`criterion` 会引入约 50 个传递依赖，与「零依赖」的立身之本冲突，因此选择手写基准 ——
       代价是没有置信区间，这个代价在 README 里明确写出来而不是藏起来
+- [x] **v0.9 TTL 过期**：entry 增加 `expire_at`（unix 毫秒，0 = 永不过期），
+      索引里也存一份 → 过期判断纯内存、零 IO；提供 `set_with_ttl()` / `expire_at()`，
+      merge 顺手物理清除过期数据。
+      **取舍**：惰性删除而非"读到就写墓碑"，避免读路径产生写操作、破坏多读单写模型；
+      代价是过期数据在 merge 前持续占盘，用 `stats().expired_keys` 把这份"待清算量"暴露出来。
+      **真实教训**：加字段 = 格式不兼容，v0.8 的数据目录会被当损坏尾部整体截断 ——
+      这就是为什么生产引擎的文件头必须有 magic + version
+
+## 后续可以做的
+
+- **TTL 主动清理**：后台线程定期扫描（目前只能靠 merge 回收）
+- **keydir 分区落盘**：索引不再全量驻留内存，让 v0.7 的布隆过滤器真正开始产生价值
+- **批量写 / 组提交**：`set` 现在每条一次 `write`，是 v0.8 基准里 4x 差距的主要来源
+- **发布到 crates.io**：目前只能 path 依赖
 
 ## 基准测试
 
@@ -160,19 +230,19 @@ cargo run --release --example bench
 ```
 
 零依赖的手写基准（不是 `criterion`）——理由见下文「为什么不用 criterion」。
-10 万 key × 128 B value（约 14.1 MB），每组都和纯 `BTreeMap<String, Vec<u8>>` 基线对打：
+10 万 key × 128 B value（约 14.8 MB），每组都和纯 `BTreeMap<String, Vec<u8>>` 基线对打：
 
 ```
-顺序写入 set                 535 ns/op     1868363 ops/s   | BTreeMap 基线     132 ns/op（4.0x）
-随机读 get                 1716 ns/op      582899 ops/s   | BTreeMap 基线     195 ns/op（8.8x）
-范围扫描 range              1262 ns/op      792226 ops/s   | BTreeMap 基线      19 ns/op（66.0x）
+顺序写入 set                 575 ns/op     1739976 ops/s   | BTreeMap 基线     147 ns/op（3.9x）
+随机读 get                 2173 ns/op      460118 ops/s   | BTreeMap 基线     258 ns/op（8.4x）
+范围扫描 range              1258 ns/op      795115 ops/s   | BTreeMap 基线      21 ns/op（60.7x）
 
 merge 压缩
-  耗时 136.35ms，16.9 MB -> 2.6 MB（压缩到 15.3%）
+  耗时 147.27ms，18.4 MB -> 3.3 MB（压缩到 18.1%）
   存活 key 100000，分段数 0 -> 1，布隆过滤器 1 个
 
 重启加载（hint 快速路径）
-  11.65ms（100000 keys，2.57 MB 分段）
+  12.33ms（100000 keys，3.34 MB 分段）
 ```
 
 怎么读这些数字（倍数给区间，因为单次运行本身就有抖动）：
@@ -180,17 +250,18 @@ merge 压缩
 | 指标 | 典型差距 | 差距来源 |
 |------|---------|---------|
 | `set` | 3–4x | 多了一次 `write` 系统调用 + CRC 计算 + 索引双锁（active + index）。绝对开销约 400 ns/op，这是「持久化」的价格，不是实现缺陷 |
-| `get` | 9–13x | 每个值都要 `pread` 一次。内存基线是纯 memcpy，而这里是真的访问了文件系统。即便有页缓存仍差一个数量级，说明**内存索引 + 磁盘取值**这个模型的读放大是实打实的 |
-| `range` | 66–71x | 这是设计取舍的代价：`range` 先在索引读锁内收集 key（很便宜），再对**每一行**调用 `get()` 取值（索引查找 + `pread`）。换来的是不长时间持锁阻塞写入，以及自动继承并发 merge 的 key 校验重试逻辑。想要快就得顺序读整段文件并跳过失效条目 —— 那是另一种权衡 |
+| `get` | 8–13x | 每个值都要 `pread` 一次。内存基线是纯 memcpy，而这里是真的访问了文件系统。即便有页缓存仍差一个数量级，说明**内存索引 + 磁盘取值**这个模型的读放大是实打实的 |
+| `range` | 60–71x | 这是设计取舍的代价：`range` 先在索引读锁内收集 key（很便宜），再对**每一行**调用 `get()` 取值（索引查找 + `pread`）。换来的是不长时间持锁阻塞写入，以及自动继承并发 merge 的 key 校验重试逻辑。想要快就得顺序读整段文件并跳过失效条目 —— 那是另一种权衡 |
 
 诚实提示：
 
 - **单次运行、无置信区间**。同一份代码连跑三次，随机读在 1.5–2.5 μs 之间波动
-  （对应 8.8x–12.8x），这是调度与页缓存状态的噪声，不是实现不稳定。
-  想要统计显著性请自己多跑几轮取中位数。
+  （对应 8–13x），这是调度与页缓存状态的噪声，不是实现不稳定。想要统计显著性请多跑几轮取中位数。
 - **全是页缓存热态**。冷启动（首次读盘）会慢一到两个数量级，这个基准测不出来。
-- `merge` 的 15.3% 不是「压缩率」，是**存活数据占比**——本例每个 key 只写过 2 版左右，
+- `merge` 的 18.1% 不是「压缩率」，是**存活数据占比**——本例每个 key 只写过 2 版左右，
   如果反复覆盖写同一批 key，这个比例会低到个位数。
+- v0.9 加了 `expire_at` 字段后 entry 变长 8 字节，磁盘与内存的绝对值随之上涨
+  （14.1 → 14.8 MB），但**相对差距基本没动** —— 这正好说明性能瓶颈在 IO 调用次数，不在记录长度。
 
 ### 为什么不用 criterion
 

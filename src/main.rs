@@ -19,6 +19,7 @@ use mini_bitcask::Bitcask;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::exit;
+use std::time::Duration;
 
 fn main() {
     let dir = match std::env::args().nth(1) {
@@ -38,10 +39,10 @@ fn main() {
         }
     };
 
-    println!("mini-bitcask v0.8 (dir: {})", dir.display());
-    println!("命令: set <k> <v> | get <k> | del <k> | list | stats");
-    println!("      merge | range <a> <b> | prefix <p> | bloom <k> | exit");
-    println!("共 {} 个 key 从日志中恢复", db.len());
+    println!("mini-bitcask v0.9 (dir: {})", dir.display());
+    println!("命令: set <k> <v> | setex <k> <秒> <v> | get <k> | del <k> | ttl <k>");
+    println!("      list | stats | merge | range <a> <b> | prefix <p> | bloom <k> | exit");
+    println!("共 {} 个存活 key 从日志中恢复", db.len());
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -70,23 +71,62 @@ fn main() {
             ("set", k, v) if !k.is_empty() && !v.is_empty() => {
                 db.set(k, v).map(|_| format!("OK (key={k})"))
             }
+            // setex <key> <秒> <value>：value 允许含空格（按第一个空白切分 ttl 与 value）
+            ("setex", k, tail) if !k.is_empty() => match tail.split_once(char::is_whitespace) {
+                Some((ttl, v)) if !v.is_empty() => match ttl.parse::<u64>() {
+                    Ok(0) => Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "ttl 必须 > 0（永不过期请用 set）",
+                    )),
+                    Ok(secs) => db
+                        .set_with_ttl(k, v, Duration::from_secs(secs))
+                        .map(|_| format!("OK (key={k}, ttl={secs}s)")),
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("ttl 不是合法秒数: {ttl}"),
+                    )),
+                },
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "用法: setex <key> <秒> <value>",
+                )),
+            },
             ("get", k, _) if !k.is_empty() => db.get_string(k).map(|v| match v {
                 Some(s) => s,
                 None => "(nil)".to_string(),
             }),
             ("del", k, _) if !k.is_empty() => db.delete(k).map(|_| "OK".to_string()),
+            ("ttl", k, _) if !k.is_empty() => match db.expire_at(k) {
+                None => Ok("(nil)".to_string()),
+                Some(0) => Ok("永不过期".to_string()),
+                Some(at) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let left = at.saturating_sub(now);
+                    Ok(format!(
+                        "剩余 {:.1}s（到期时间戳 {at}）",
+                        left as f64 / 1000.0
+                    ))
+                }
+            },
             ("list", "", _) => Ok(db.keys().join("\n")),
             ("stats", "", _) => {
                 let s = db.stats();
                 let mut out = format!(
-                    "live_keys={} total_bytes={} (~{:.1} KiB) segments={} active={} B blooms={}",
+                    "live_keys={} expired={} total_bytes={} (~{:.1} KiB) segments={} active={} B blooms={}",
                     s.live_keys,
+                    s.expired_keys,
                     s.total_bytes,
                     s.total_bytes as f64 / 1024.0,
                     s.segment_count,
                     s.active_bytes,
                     s.bloom_count
                 );
+                if s.expired_keys > 0 {
+                    out.push_str(" [有已过期 key 待 merge 回收空间]");
+                }
                 if s.corrupt_tail_bytes > 0 {
                     out.push_str(&format!(
                         " [打开时截断了 {} 字节损坏尾部]",
@@ -121,7 +161,7 @@ fn main() {
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "未知命令，支持: set/get/del/list/stats/merge/range/prefix/bloom/exit",
+                "未知命令，支持: set/setex/get/del/ttl/list/stats/merge/range/prefix/bloom/exit",
             )),
         };
 
