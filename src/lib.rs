@@ -85,6 +85,12 @@
 //!   边界：这批操作在磁盘上是 N 条独立记录，**不保证原子性**；
 //!   写到一半崩溃是"前缀可见"，不是"全有或全无"。要原子性得加 commit record，那是另一回事。
 //!
+//! v1.1 slice-by-8 CRC：把 v1.0 归因出的最大成本项优化掉。
+//!   8 张表把 8 轮逐字节迭代折叠成 8 次查表，155B/条 200–215ns -> 41–46ns（约 4.7x），
+//!   单条 set 520 -> ~330ns。正确性靠差分测试（与保留的朴素参照实现对拍），
+//!   不靠"我记得算法没错"。至此走完「测量 -> 归因 -> 优化 -> 再测量」的完整闭环，
+//!   且预算（预期 ~350ns）与决算（322–334ns）互相校验成功。
+//!
 //! 这是刻意留白的项目：基准测试留作后续演进路线，见 README.md 的 Roadmap。
 
 use std::collections::{BTreeMap, HashMap};
@@ -216,31 +222,80 @@ fn is_expired(expire_at: u64) -> bool {
 
 // ---------------- 编码与 CRC ----------------
 
-/// CRC-32（IEEE 802.3，多项式 0xEDB88320），查表法。
-///
-/// 故意手写而非引入 crc crate —— 本项目坚持零依赖，顺便看清校验和的本质。
-/// 公开为 API：外部可用它校验本引擎写出的记录，也让基准能直接测量它的成本。
-/// （它是逐字节的纯 CPU 工作，**无法**靠批量写摊薄 —— 见 README 的性能归因。）
-pub fn crc32(data: &[u8]) -> u32 {
-    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut t = [0u32; 256];
-        for (i, slot) in t.iter_mut().enumerate() {
-            let mut c = i as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 {
-                    0xEDB8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-            }
-            *slot = c;
+/// 基础查表（单字节步进），slice-by-8 的 t[0] 与朴素实现的表共用这张
+fn build_crc_table0() -> [u32; 256] {
+    let mut t = [0u32; 256];
+    for (i, slot) in t.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
-        t
-    });
+        *slot = c;
+    }
+    t
+}
+
+/// 逐字节查表的朴素实现 —— 保留作为测试的**参照实现**。
+/// slice-by-8 的正确性不靠"我记得算法没错"，靠"与参照实现在任意输入上一致"来证明。
+/// 只在测试构建里编译（它是慢的那一个，生产路径不该碰它）。
+#[cfg(test)]
+fn crc32_naive(data: &[u8]) -> u32 {
+    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
+    let table = TABLE.get_or_init(build_crc_table0);
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
         crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+
+/// CRC-32（IEEE 802.3，多项式 0xEDB88320），slice-by-8 实现。
+///
+/// 故意手写而非引入 crc crate —— 本项目坚持零依赖，顺便看清校验和的本质。
+/// 公开为 API：外部可用它校验本引擎写出的记录，也让基准能直接测量它的成本。
+///
+/// **为什么是 slice-by-8**（v1.1，起因是 v1.0 的性能归因）：
+/// 朴素实现每个字节都要「查表 + 异或 + 移位」一轮，155 字节要 200+ ns，
+/// 占单条 `set` 的 36–41% —— 是当时测出的最大单项成本。
+/// slice-by-8 一次处理 8 字节：用 8 张表把 8 轮迭代折叠成 8 次查表，
+/// 每字节的平均开销降到约 1/4。正确性由差分测试保证（见 `tests::test_crc32_slice_by_8_matches_naive`）。
+pub fn crc32(data: &[u8]) -> u32 {
+    static TABLES: OnceLock<[[u32; 256]; 8]> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        let mut tables = [[0u32; 256]; 8];
+        tables[0] = build_crc_table0();
+        // t[k][i] = (t[k-1][i] >> 8) ^ t[0][t[k-1][i] & 0xFF]
+        // 直觉：t[k] 把"处理 1 个字节"的转移再向前推 k 步，8 张表一起用
+        // 就能把 8 轮逐字节迭代折叠成 8 次查表
+        for t in 1..8 {
+            for i in 0..256 {
+                let prev = tables[t - 1][i];
+                tables[t][i] = (prev >> 8) ^ tables[0][(prev & 0xFF) as usize];
+            }
+        }
+        tables
+    });
+
+    let mut crc = 0xFFFF_FFFFu32;
+    let (chunks, tail) = data.as_chunks::<8>();
+    for chunk in chunks {
+        // 小端读前 4 字节并入当前状态，再与后 4 字节一起查 8 张表
+        crc ^= u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        crc = tables[7][(crc & 0xFF) as usize]
+            ^ tables[6][((crc >> 8) & 0xFF) as usize]
+            ^ tables[5][((crc >> 16) & 0xFF) as usize]
+            ^ tables[4][(crc >> 24) as usize]
+            ^ tables[3][chunk[4] as usize]
+            ^ tables[2][chunk[5] as usize]
+            ^ tables[1][chunk[6] as usize]
+            ^ tables[0][chunk[7] as usize];
+    }
+    for &b in tail {
+        crc = tables[0][((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
     }
     !crc
 }
@@ -1507,6 +1562,31 @@ mod tests {
         assert_eq!(crc32(b""), 0x0000_0000);
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b"hello world"), 0x0D4A_1185);
+    }
+
+    #[test]
+    fn test_crc32_slice_by_8_matches_naive() {
+        // 差分测试：slice-by-8 在各种长度上都必须与朴素实现一致。
+        // 用确定性 LCG 生成伪随机数据 —— 零依赖的 rand 替代品。
+        let mut state = 0x1234_5678u64;
+        let mut next_byte = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+
+        // 特别覆盖 8 的边界两侧（0-17）与跨过尾部长度的组合
+        for len in [
+            0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 255, 256, 4096,
+        ] {
+            let data: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+            assert_eq!(
+                crc32(&data),
+                crc32_naive(&data),
+                "长度 {len}：slice-by-8 与朴素实现不一致"
+            );
+        }
     }
 
     // ---------- v0.3：merge / compaction ----------

@@ -39,7 +39,7 @@ fn main() {
         }
     };
 
-    println!("mini-bitcask v1.0 (dir: {})", dir.display());
+    println!("mini-bitcask v1.1 (dir: {})", dir.display());
     println!("命令: set <k> <v> | setex <k> <秒> <v> | get <k> | del <k> | ttl <k>");
     println!("      batch <n> <前缀> | list | stats | merge");
     println!("      range <a> <b> | prefix <p> | bloom <k> | exit");
